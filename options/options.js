@@ -114,41 +114,46 @@ function providerCard(p, idx) {
   probeRow.appendChild(probeStatus);
   card.appendChild(probeRow);
 
-  // 模型列表
+  // 模型列表：每个模型一行，**各自设置上下文上限与回复上限**
+  //（不同模型的上限本来就不一样，之前是一个全局值，不够用）
   const modelLabel = document.createElement("div");
   modelLabel.className = "block-label";
-  modelLabel.textContent = "模型（每行一个：模型ID 或 模型ID|显示名 或 模型ID|显示名|vision，vision 表示支持图片理解）";
+  modelLabel.textContent = "模型（每个模型可单独设置上限；留空则用下面「默认选项」里的默认值）";
   card.appendChild(modelLabel);
 
-  const modelArea = document.createElement("textarea");
-  modelArea.value = (p.models || [])
-    .map((m) => {
-      const parts = [m.id];
-      if (m.label && m.label !== m.id) parts.push(m.label);
-      else if (m.vision) parts.push("");
-      if (m.vision) parts.push("vision");
-      return parts.join("|");
-    })
-    .join("\n");
-  modelArea.addEventListener("change", () => {
-    p.models = modelArea.value
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const segs = line.split("|").map((s) => s.trim());
-        const id = segs[0];
-        let label = segs[1] || id;
-        let vision = false;
-        for (const s of segs.slice(1)) {
-          if (s.toLowerCase() === "vision") vision = true;
-        }
-        if (segs.length >= 2 && segs[1].toLowerCase() === "vision") label = id;
-        return { id, label, vision };
-      });
-    renderDefaultSelectors();
+  const modelTable = document.createElement("div");
+  modelTable.className = "model-table";
+  const modelHead = document.createElement("div");
+  modelHead.className = "model-row model-head";
+  for (const t of ["模型 ID", "显示名", "图片", "上下文上限", "回复上限", ""]) {
+    const c = document.createElement("span");
+    c.textContent = t;
+    modelHead.appendChild(c);
+  }
+  modelTable.appendChild(modelHead);
+
+  (p.models || []).forEach((m, mIdx) => {
+    modelTable.appendChild(modelRow(p, m, mIdx));
   });
-  card.appendChild(modelArea);
+  card.appendChild(modelTable);
+
+  const addModelBtn = document.createElement("button");
+  addModelBtn.className = "tiny";
+  addModelBtn.textContent = "+ 添加模型";
+  addModelBtn.addEventListener("click", () => {
+    if (!p.models) p.models = [];
+    p.models.push({ id: "", label: "", vision: false, contextWindow: null, maxTokens: null });
+    render();
+  });
+  card.appendChild(addModelBtn);
+
+  const modelHint = document.createElement("p");
+  modelHint.className = "hint";
+  modelHint.innerHTML =
+    "上下文上限：这个模型一次能装多少 token（到达你设置的阈值时会自动压缩历史）。" +
+    "回复上限：单次回复最多生成多少 token。<br/>" +
+    "常见值：128000 / 4096（长上下文模型），32768 / 2048（小模型）；不确定就先留空。";
+  card.appendChild(modelHint);
 
   // API Keys
   const keyLabel = document.createElement("div");
@@ -173,6 +178,79 @@ function providerCard(p, idx) {
   card.appendChild(addKeyBtn);
 
   return card;
+}
+
+// 一个模型的编辑行：ID / 显示名 / 图片 / 上下文上限 / 回复上限 / 删除
+function modelRow(provider, model, mIdx) {
+  const row = document.createElement("div");
+  row.className = "model-row";
+
+  const idInput = document.createElement("input");
+  idInput.type = "text";
+  idInput.value = model.id || "";
+  idInput.placeholder = "模型 ID";
+  idInput.addEventListener("change", () => {
+    model.id = idInput.value.trim();
+    renderDefaultSelectors();
+  });
+
+  const labelInput = document.createElement("input");
+  labelInput.type = "text";
+  labelInput.value = model.label || "";
+  labelInput.placeholder = "显示名（可留空）";
+  labelInput.addEventListener("change", () => {
+    model.label = labelInput.value.trim();
+    renderDefaultSelectors();
+  });
+
+  const visionWrap = document.createElement("label");
+  visionWrap.className = "model-vision";
+  visionWrap.title = "勾选表示这个模型支持图片理解（可附截图）";
+  const visionInput = document.createElement("input");
+  visionInput.type = "checkbox";
+  visionInput.checked = !!model.vision;
+  visionInput.addEventListener("change", () => (model.vision = visionInput.checked));
+  visionWrap.appendChild(visionInput);
+
+  const mkNum = (value, placeholder, title, apply) => {
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.min = "0";
+    inp.step = "1000";
+    inp.value = value ? String(value) : "";
+    inp.placeholder = placeholder;
+    inp.title = title;
+    inp.addEventListener("change", () => {
+      const n = Number(inp.value);
+      apply(Number.isFinite(n) && n > 0 ? Math.round(n) : null);
+    });
+    return inp;
+  };
+
+  const ctxInput = mkNum(
+    model.contextWindow,
+    "128000",
+    "这个模型的上下文上限（token）。留空用默认值。",
+    (v) => (model.contextWindow = v)
+  );
+  const maxInput = mkNum(
+    model.maxTokens,
+    "4096",
+    "单次回复最多生成多少 token。留空用默认值。",
+    (v) => (model.maxTokens = v)
+  );
+
+  const del = document.createElement("button");
+  del.className = "tiny danger";
+  del.textContent = "×";
+  del.title = "删除这个模型";
+  del.addEventListener("click", () => {
+    provider.models.splice(mIdx, 1);
+    render();
+  });
+
+  for (const el of [idInput, labelInput, visionWrap, ctxInput, maxInput, del]) row.appendChild(el);
+  return row;
 }
 
 function keyRow(provider, key, kIdx) {

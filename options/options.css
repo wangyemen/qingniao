@@ -288,6 +288,54 @@ button.tiny {
   font-weight: 500;
 }
 
+/* 模型表格：每个模型一行，各自设置上下文/回复上限 */
+.model-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.model-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.4fr) minmax(90px, 1fr) 46px minmax(88px, 0.8fr) minmax(88px, 0.8fr) 34px;
+  gap: 8px;
+  align-items: center;
+}
+.model-row.model-head {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-weight: 600;
+  padding: 0 2px;
+}
+.model-row input[type="text"],
+.model-row input[type="number"] {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 9px;
+  font-size: 12px;
+}
+.model-vision {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+.model-vision input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+@media (max-width: 760px) {
+  .model-row,
+  .model-row.model-head {
+    grid-template-columns: 1fr 1fr;
+  }
+  .model-row.model-head {
+    display: none;
+  }
+}
+
 .check {
   display: flex;
   align-items: center;

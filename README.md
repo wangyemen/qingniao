@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.7.1-2dd4bf" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.1-2dd4bf" />
   <img alt="manifest" src="https://img.shields.io/badge/Manifest-V3-2dd4bf" />
   <img alt="chrome" src="https://img.shields.io/badge/Chrome-%E2%89%A5%20116-2dd4bf" />
 </p>
@@ -72,9 +72,22 @@
 - 联网时还会对比仓库里的 `version.txt`，发现更新的版本就提示你，并在工具栏图标上打一个「新」标记；
 - 设置页的「技能市场」标签下随时可以回看完整更新日志。
 
+### 自动化任务：重复性动作交给程序，AI 先去休息
+- 判据：**同一个动作要做 2 次以上**、或"做完等一会儿再做一遍"、或**要一直翻到底**——就该用自动化；
+- AI 只写"循环做什么 + 什么时候停"，程序在页面里跑循环（**不占模型请求、不烧 token**）；
+- 停止条件：找不到目标 / 按钮变灰 / 页面连续没变化 / 出现某段文字；另有轮数、总时长、连续失败三重保护；
+- 跑完自动**唤醒 AI**，让它先看页面现状再接着做剩下的（你离开页面、关掉侧栏也照常）；
+- 步骤用的就是 AI 平时的动作工具（`find` 定位 + `click`/`fill`/`press`/`scroll`…），不是另一套实现。
+
+### 拟人打字（防网页检测）
+- 默认 `fill` 是"一次性写入"，又快又省；被反自动化拦住时（登录框、验证码附近、检测严格的站点）改用
+  `{"action":"fill","target":N,"value":"…","human":true,"speed":"normal"}` 或 `type` 动作；
+- 逐字输入、字符间随机停顿、标点后停更久、偶尔"想一下"，速度可选 `fast` / `normal` / `slow`。
+
 ### 模型与厂商
 - 兼容 OpenAI 格式的接口，可添加多个供应商；
 - 模型可选、每个工作区可以不同、也可以在任务中途改；
+- **每个模型可单独设置上下文上限与回复 Token 上限**（不同模型的上限本来就不一样），没配才用全局默认；
 - 支持"深度思考"参数与视觉模型（附截图）。
 
 ## 安装

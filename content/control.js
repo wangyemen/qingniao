@@ -1755,43 +1755,110 @@
     return ok;
   }
 
-  // 逐字输入：每个字符都走一次 keydown → insertText → keyup。
-  // 有些编辑器（比如监听 keydown 来维护内部状态的）只认"像打字"的事件流。
-  function typeIntoEditable(el, text) {
+  // 拟人打字节奏：每个字符之间随机停顿，标点后停久一点，偶尔"想一下"。
+//
+// 为什么要它：一次性把整段文字写进表单，行为特征太"机器"（0 毫秒写完），
+// 一些站点会据此判定为脚本。按真人节奏逐字输入可以显著降低被识别的概率。
+// 但也更慢：默认 fill 仍然是一次写入，只有你显式要求 human 时才走这条路。
+  const TYPING_SPEEDS = {
+    fast: { min: 22, max: 55, think: 120, thinkEvery: [12, 22] },
+    normal: { min: 45, max: 110, think: 260, thinkEvery: [7, 14] },
+    slow: { min: 110, max: 240, think: 520, thinkEvery: [5, 10] },
+  };
+  const PUNCT_PAUSE = { "，": 1.7, "。": 2.1, "！": 2.1, "？": 2.1, "；": 1.6, "：": 1.5, "、": 1.3, ",": 1.6, ".": 1.8, "!": 1.8, "?": 1.8, ";": 1.5, ":": 1.4, "\n": 2.4 };
+
+  function typingProfile(opts) {
+    const preset =
+      typeof opts.speed === "string" && TYPING_SPEEDS[opts.speed]
+        ? TYPING_SPEEDS[opts.speed]
+        : TYPING_SPEEDS.normal;
+    const min = Number(opts.minDelay) > 0 ? Number(opts.minDelay) : preset.min;
+    const max = Number(opts.maxDelay) > min ? Number(opts.maxDelay) : Math.max(min + 20, preset.max);
+    return { min, max, think: preset.think, thinkEvery: preset.thinkEvery };
+  }
+
+  function rand(min, max) {
+    return min + Math.random() * Math.max(1, max - min);
+  }
+
+  function charsOf(s) {
+    return Array.from(String(s || "")).length;
+  }
+
+  // 逐字输入：每个字符都走一次 keydown → beforeinput → insertText → input → keyup，
+  // 并保持真人节奏（异步，因此调用方必须 await）。
+  async function typeIntoEditable(el, text, opts = {}) {
     const doc = el.ownerDocument || document;
+    const prof = typingProfile(opts);
     focusEl(el);
     selectAllIn(el);
     const chars = Array.from(String(text || ""));
-    for (const ch of chars) {
+    let sinceThink = 0;
+    let nextThink = Math.round(rand(prof.thinkEvery[0], prof.thinkEvery[1]));
+
+    for (let i = 0; i < chars.length; i++) {
+      const ch = chars[i];
+      const code = ch.charCodeAt(0);
+      const keyOpts = {
+        key: ch,
+        code: /[a-zA-Z]/.test(ch) ? "Key" + ch.toUpperCase() : /[0-9]/.test(ch) ? "Digit" + ch : /^\s$/.test(ch) ? "Space" : "",
+        bubbles: true,
+        cancelable: true,
+        keyCode: code,
+        which: code,
+      };
       try {
-        el.dispatchEvent(
-          new KeyboardEvent("keydown", {
-            key: ch,
-            bubbles: true,
-            cancelable: true,
-            keyCode: ch.charCodeAt(0),
-            which: ch.charCodeAt(0),
-          })
-        );
+        el.dispatchEvent(new KeyboardEvent("keydown", keyOpts));
       } catch (_) {}
       try {
-        doc.execCommand("insertText", false, ch);
+        el.dispatchEvent(new KeyboardEvent("keypress", keyOpts));
+      } catch (_) {}
+      try {
+        const be = new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertText",
+          data: ch,
+        });
+        el.dispatchEvent(be);
+      } catch (_) {}
+
+      let inserted = false;
+      try {
+        inserted = doc.execCommand("insertText", false, ch);
       } catch (_) {
-        el.textContent = (el.textContent || "") + ch;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
+        inserted = false;
       }
+      if (!inserted) {
+        // 退路：直接改文本 + 补一个 input 事件（内容型编辑器靠这个）
+        if ("value" in el) el.value = (el.value || "") + ch;
+        else el.textContent = (el.textContent || "") + ch;
+        try {
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
+        } catch (_) {
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      }
+
       try {
-        el.dispatchEvent(
-          new KeyboardEvent("keyup", {
-            key: ch,
-            bubbles: true,
-            cancelable: true,
-            keyCode: ch.charCodeAt(0),
-            which: ch.charCodeAt(0),
-          })
-        );
+        el.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
       } catch (_) {}
+
+      // 节奏：基础随机间隔 + 标点后加长 + 偶尔"想一下"
+      let wait = rand(prof.min, prof.max);
+      const mult = PUNCT_PAUSE[ch];
+      if (mult) wait *= mult;
+      sinceThink++;
+      if (sinceThink >= nextThink) {
+        wait += rand(prof.think * 0.6, prof.think * 1.4);
+        sinceThink = 0;
+        nextThink = Math.round(rand(prof.thinkEvery[0], prof.thinkEvery[1]));
+      }
+      await autoSleep(wait);
     }
+    try {
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (_) {}
   }
 
   function fillPlainInput(el, text) {
@@ -1853,6 +1920,26 @@
       case "fill": {
         const v = a.value == null ? "" : String(a.value);
         el.scrollIntoView({ block: "center", behavior: "instant" });
+        // human:true → 不一次性写完，改成真人节奏逐字输入（用于有反自动化检测的站点）
+        const human = a.human === true || a.human === "true" || a.typing === "human";
+        if (human) {
+          if (isRichText(el)) {
+            try {
+              el.innerHTML = "";
+            } catch (_) {}
+          } else {
+            fillPlainInput(el, "");
+          }
+          await typeIntoEditable(el, v, a);
+          if (verifyFilled(el, v)) {
+            return { ok: true, msg: `已按真人节奏输入「${clip(v, 30)}」（${charsOf(v)} 字符）` };
+          }
+          return {
+            ok: false,
+            msg: `按真人节奏输入「${clip(v, 30)}」后没有读到内容`,
+            hint: "该元素可能不是可输入区域，或需要先 click 聚焦；也可能它确实抗拒逐字输入（那就用 fill 一次性写入）。",
+          };
+        }
         if (isRichText(el)) {
           fillContentEditable(el, v);
         } else {
@@ -1865,7 +1952,7 @@
             try {
               el.innerHTML = "";
             } catch (_) {}
-            typeIntoEditable(el, v);
+            await typeIntoEditable(el, v, a);
             if (verifyFilled(el, v)) {
               return { ok: true, msg: `已填入「${clip(v, 30)}」（逐字输入）` };
             }
@@ -1875,21 +1962,24 @@
             msg: `已尝试写入「${clip(v, 30)}」，但页面没有接受这次输入`,
             hint:
               "如果这是富文本编辑器：先对该元素执行 click 让它获得焦点，再重试 fill；" +
-              "若它在 iframe / shadow DOM 里，也先点一下再试。仍不行就用 extract 看看它当前内容，必要时改用 type 逐字输入。",
+              "若它在 iframe / shadow DOM 里，也先点一下再试。仍不行就用 extract 看看它当前内容，" +
+              "必要时改用 type 逐字输入（要更慢更逼真可加 \"human\":true 与 \"speed\":\"slow\"）。",
           };
         }
         return { ok: true, msg: `已填入「${clip(v, 30)}」` };
       }
       case "type": {
-        // 逐字输入：给那些只认真人按键流的编辑器（评论框、聊天输入、快捷指令框）
+        // 逐字输入：给那些只认真人按键流的编辑器（评论框、聊天输入、快捷指令框），
+        // 也是"怕被网页判定成脚本"时的选择。默认 normal 节奏，可传 speed: fast/normal/slow。
         const v = a.value == null ? "" : String(a.value);
         const target = (a.target != null ? findByIdx(a.target) : null) || document.activeElement;
         if (!target) return { ok: false, msg: "没有可输入的目标元素" };
         target.scrollIntoView({ block: "center", behavior: "instant" });
         if (isRichText(target)) {
-          typeIntoEditable(target, v);
+          await typeIntoEditable(target, v, a);
         } else {
-          fillPlainInput(target, v);
+          fillPlainInput(target, "");
+          await typeIntoEditable(target, v, a);
         }
         if (!verifyFilled(target, v)) {
           return {
@@ -2269,5 +2359,248 @@
     return true;
   }
 
-  globalThis.__aiCtl = { snapshot, act, banner, armDefer, disarmDefer };
+  // ===== 自动化任务：把"重复性动作"交给程序跑循环 =====
+  //
+  // 为什么要有它：像"点一下等两秒、循环 3 次""PPT 一页页翻到底"这类事，
+  // 如果每步都走一次模型，又慢又费 token。AI 只需要声明"循环做什么 / 什么时候停"，
+  // 循环在这里跑完，跑完再唤醒 AI 检查现状、接着干剩下的。
+  //
+  // 安全性：① 迭代上限 500；② 总时长上限（默认 2 分钟，最多 10 分钟）；
+  //         ③ 连续 5 轮动作全部失败就停；④ 正常结束与异常都会回报，绝不静默卡死。
+  const AUTOMATE_MAX_ITER = 500;
+  const AUTOMATE_MAX_MS = 10 * 60 * 1000;
+  const AUTOMATE_FAIL_LIMIT = 5;
+
+  function autoSleep(ms) {
+    return new Promise((r) => setTimeout(r, Math.max(0, Math.min(20000, ms || 0))));
+  }
+
+  function keyCodeOf(key) {
+    const map = {
+      ArrowRight: 39,
+      ArrowLeft: 37,
+      ArrowDown: 40,
+      ArrowUp: 38,
+      PageDown: 34,
+      PageUp: 33,
+      Enter: 13,
+      Space: 32,
+      " ": 32,
+    };
+    return map[key] || 0;
+  }
+
+  // 页面"看起来变了没"：用于 nochange 停止条件（翻到底/没有下一页了）
+  function pageSignature() {
+    try {
+      const t = (document.body && document.body.innerText) || "";
+      const marks = (t.match(/第\s*\d+\s*页|\d+\s*\/\s*\d+/g) || []).join("|");
+      return [
+        document.title,
+        location.href,
+        t.length,
+        marks,
+        window.scrollY,
+        document.body ? document.body.scrollHeight : 0,
+      ].join("|");
+    } catch (_) {
+      return String(Date.now());
+    }
+  }
+
+  // 把步骤翻译成"标准动作"后交给 act() 执行。
+  //
+  // ⚠️ 关键设计（别再改回自己实现）：
+  //    自动化**不自己实现点击/填写**，而是复用 AI 手动操作时的同一套工具
+  //    —— 先 find 解析目标（多策略定位、编号表），再 act 执行（合成事件链、回读校验、
+  //    富文本处理都在里面）。自动化只是把这些工具调用"串联起来跑循环"。
+  //    我一开始另写了一份简化定位，结果真实页面上"找不到下一页"，
+  //    而同一个页面上 act 的 click 就能点到 —— 两套实现必然分叉。
+  async function autoResolveTarget(step) {
+    if (step.target != null && step.target !== "") return { target: Number(step.target), label: "" };
+    const q = step.text || step.label || "";
+    if (!q) return { target: null, label: "" };
+    const r = await act({ action: "find", text: String(q) });
+    if (!r || !r.ok || !r.data) return { target: null, label: String(q) };
+    const m = /\[(\d+)\]/.exec(String(r.data));
+    return m ? { target: Number(m[1]), label: String(q) } : { target: null, label: String(q) };
+  }
+
+  async function autoStep(step) {
+    const op = String((step && (step.op || step.type)) || "click").toLowerCase();
+
+    if (op === "wait" || op === "sleep") {
+      const ms = Number(step.ms) > 0 ? Number(step.ms) : Number(step.seconds) > 0 ? Number(step.seconds) * 1000 : 500;
+      await autoSleep(ms);
+      return { ok: true, msg: `等待 ${ms}ms` };
+    }
+
+    // 需要定位目标的步骤：先 find（与手动操作同一条路径），再 act
+    if (["click", "fill", "type", "select", "check", "extract"].includes(op)) {
+      const { target, label } = await autoResolveTarget(step);
+      if (target == null) {
+        return {
+          ok: false,
+          msg: `找不到要操作的「${label || step.selector || "元素"}」（用的就是手动操作那套定位）`,
+        };
+      }
+      const mapped = { action: op, target };
+      if (op === "fill" || op === "type") {
+        mapped.value = step.value == null ? "" : String(step.value);
+        if (step.human !== undefined) mapped.human = step.human === true || step.human === "true";
+        if (step.speed !== undefined) mapped.speed = step.speed;
+      }
+      if (op === "select") mapped.value = step.option == null ? step.value : step.option;
+      if (op === "check") mapped.value = !(step.value === false || step.value === "false");
+      const r = await act(mapped);
+      return r && typeof r === "object"
+        ? { ...r, msg: r.msg || `${op}「${label}」` }
+        : { ok: false, msg: "页面没有响应这个步骤" };
+    }
+
+    // 不需要目标的步骤：直接翻译成标准动作
+    if (op === "press" || op === "key") {
+      const r = await act({ action: "press", key: String(step.key || step.text || "ArrowRight") });
+      return r && typeof r === "object" ? r : { ok: false, msg: "按键没生效" };
+    }
+    if (op === "scroll") {
+      const r = await act({
+        action: "scroll",
+        direction: String(step.dir || step.direction || "down"),
+        amount: Number(step.amount) > 0 ? Number(step.amount) : undefined,
+      });
+      return r && typeof r === "object" ? r : { ok: false, msg: "滚动没生效" };
+    }
+    if (op === "navigate") {
+      const r = await act({ action: "navigate", url: String(step.url || "") });
+      return r && typeof r === "object" ? r : { ok: false, msg: "跳转没生效" };
+    }
+    if (op === "screenshot") {
+      const r = await act({ action: "screenshot" });
+      return r && typeof r === "object" ? r : { ok: false, msg: "截图失败" };
+    }
+    return { ok: false, msg: `不认识的步骤：${op}` };
+  }
+
+  // 停止条件：present / absent / disabled（按钮变灰后 find 就找不到了）/ nochange
+  async function autoUntilMet(until, iter, sig, prevSig) {
+    if (!until || typeof until !== "object") return false;
+    const op = String(until.op || until.type || "").toLowerCase();
+    if (op === "nochange") return iter >= 2 && sig === prevSig;
+    if (op === "absent" || op === "present" || op === "disabled") {
+      const q = until.text || until.label || "";
+      if (!q) return false;
+      const r = await act({ action: "find", text: String(q) });
+      const found = !!(r && r.ok && r.data);
+      if (op === "present") return found;
+      // absent 与 disabled 都表示"这个按钮找不到 / 不可操作了"
+      return !found;
+    }
+    return false;
+  }
+
+  async function automate(spec) {
+    const s = spec && typeof spec === "object" ? spec : {};
+    const steps = Array.isArray(s.steps) ? s.steps.filter((x) => x && typeof x === "object") : [];
+    if (!steps.length) {
+      return {
+        ok: false,
+        msg: "automate 需要 steps（要循环做什么）",
+        hint: '例如 {"action":"automate","repeat":3,"steps":[{"op":"click","text":"继续"},{"op":"wait","ms":2000}]}',
+      };
+    }
+    const repeat = Math.max(1, Math.min(AUTOMATE_MAX_ITER, Number(s.repeat) > 0 ? Math.round(Number(s.repeat)) : 1));
+    const intervalMs = Math.max(0, Math.min(20000, Number(s.intervalMs) >= 0 ? Number(s.intervalMs) : 300));
+    const maxMs = Math.max(1000, Math.min(AUTOMATE_MAX_MS, Number(s.maxMs) > 0 ? Number(s.maxMs) : 120000));
+    const until = s.until && typeof s.until === "object" ? s.until : null;
+
+    const startedAt = Date.now();
+    const log = [];
+    let iterations = 0;
+    let stoppedBy = "repeat";
+    let failStreak = 0;
+    let prevSig = pageSignature();
+    const push = (m) => {
+      if (log.length < 60) log.push(m);
+    };
+
+    try {
+      for (let i = 1; i <= repeat; i++) {
+        if (Date.now() - startedAt > maxMs) {
+          stoppedBy = "timeout";
+          break;
+        }
+        const sig = pageSignature();
+        // 注意：autoUntilMet 是 async 的，必须 await —— 忘记 await 会得到"永远为真"的 Promise，
+        // 表现就是第 1 轮就判停、0 轮结束（踩过一次）。
+        if (until && (await autoUntilMet(until, i, sig, prevSig))) {
+          stoppedBy = "until:" + String(until.op || until.type || "");
+          break;
+        }
+        prevSig = sig;
+        iterations = i;
+        let roundOk = false;
+        for (const step of steps) {
+          if (Date.now() - startedAt > maxMs) {
+            stoppedBy = "timeout";
+            break;
+          }
+          let r;
+          try {
+            r = await autoStep(step);
+          } catch (err) {
+            r = { ok: false, msg: String((err && err.message) || err) };
+          }
+          push(`#${i} ${r.ok ? "✓" : "✗"} ${r.msg || ""}`);
+          if (r.ok) roundOk = true;
+        }
+        if (stoppedBy === "timeout") break;
+        if (!roundOk) {
+          failStreak++;
+          if (failStreak >= AUTOMATE_FAIL_LIMIT) {
+            stoppedBy = "stepFailed";
+            break;
+          }
+        } else {
+          failStreak = 0;
+        }
+        if (intervalMs) await autoSleep(intervalMs);
+      }
+      if (iterations >= repeat && stoppedBy === "repeat" && until) stoppedBy = "repeat(未满足停止条件)";
+    } catch (err) {
+      stoppedBy = "error";
+      push("异常：" + String((err && err.message) || err));
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    const result = {
+      ok: true,
+      msg: `自动化任务结束：跑了 ${iterations} 轮（约 ${Math.round(elapsedMs / 1000)} 秒，停止原因 ${stoppedBy}）`,
+      iterations,
+      stoppedBy,
+      elapsedMs,
+      log,
+      pageHint: {
+        title: document.title,
+        url: location.href,
+        scrollY: Math.round(window.scrollY),
+        scrollHeight: document.body ? document.body.scrollHeight : 0,
+      },
+    };
+
+    // 关键一步：**由页面直接通知 SW**"自动化任务结束"，SW 会唤醒 AI 去检查现状并接着干。
+    // 放在页面里发（而不是靠侧栏 await），这样即使侧栏在跑的过程中被关掉/切走，也一定唤醒。
+    if (s.taskId) {
+      try {
+        chrome.runtime.sendMessage({
+          type: "defer:fired",
+          taskId: s.taskId,
+          reason: `自动化任务「${s.name || "未命名"}」结束：跑了 ${iterations} 轮，停止原因 ${stoppedBy}`,
+        });
+      } catch (_) {}
+    }
+    return result;
+  }
+
+  globalThis.__aiCtl = { snapshot, act, banner, armDefer, disarmDefer, automate };
 })();

@@ -30,7 +30,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------- 本地测试页 ----------
 const server = http.createServer((req, res) => {
   const name = path.basename(String(req.url || "").split("?")[0].split("#")[0]);
-  const allowed = new Set(["page1.html", "page2.html"]);
+  const allowed = new Set(["page1.html", "page2.html", "page9.html"]);
   if (!allowed.has(name)) {
     res.writeHead(404);
     res.end("nf");
@@ -922,7 +922,7 @@ const vtRes = await pageB.evaluate(async () => {
   const mod = await import(chrome.runtime.getURL("lib/updates.js"));
   const vt = await mod.loadLocalVersionTxt();
   if (!vt) return { ok: false };
-  const between = mod.changelogBetween(vt, "0.5.5", "0.7.0");
+  const between = mod.changelogBetween(vt, "0.1.0", "0.4.0");
   return {
     ok: true,
     latest: vt.latest,
@@ -931,8 +931,12 @@ const vtRes = await pageB.evaluate(async () => {
     newerThanSelf: mod.newerThan(vt, "0.1.0"),
   };
 });
-check("随包的 version.txt 能解析出版本与日志", vtRes.ok && vtRes.entries >= 5, JSON.stringify(vtRes));
-check("更新日志能按版本区间取（用于弹窗）", vtRes.betweenVersions.includes("0.7.0") && vtRes.betweenVersions.includes("0.6.0"), JSON.stringify(vtRes));
+check("随包的 version.txt 能解析出版本与日志", vtRes.ok && vtRes.entries >= 4, JSON.stringify(vtRes));
+check(
+  "更新日志能按版本区间取（用于弹窗）",
+  vtRes.betweenVersions.includes("0.4.0") && vtRes.betweenVersions.includes("0.3.0"),
+  JSON.stringify(vtRes)
+);
 
 const modalRes = await pageB.evaluate(async () => {
   const KEY = "ai_update_state";
@@ -958,7 +962,7 @@ const updateModalRes = await pageB.evaluate(() => {
     visible: !!modal && !modal.classList.contains("hidden") && cs.display !== "none",
     display: cs ? cs.display : "",
     title: title ? title.textContent : "",
-    hasEntry: !!(body && /0\.7\.0|0\.6\.0/.test(body.innerText || "")),
+    hasEntry: !!(body && /0\.4\.|0\.3\.0/.test(body.innerText || "")),
     bodyLen: body ? (body.innerText || "").length : 0,
   };
 });
@@ -1012,6 +1016,104 @@ check(
   floaters.picker === "none" && floaters.slash === "none",
   JSON.stringify(floaters)
 );
+
+// ---------- ㉑ 自动化任务：重复性动作交给程序跑循环，跑完唤醒 AI ----------
+// 用户要求：像"点一下等两秒循环 3 次""PPT 一页页翻到底"这种重复动作，
+// 让程序去跑循环，AI 先休息；跑完唤醒 AI，先检查再继续。
+const pageAuto = await browser.newPage();
+await pageAuto.goto(`http://127.0.0.1:${PORT}/page9.html`, { waitUntil: "load" });
+await pageAuto.bringToFront();
+await sleep(600);
+
+// 让这个页面成为一份新工作区（发一条消息）
+await pageB.evaluate(() => {
+  window.__autoWake = 0;
+  window.__autoReq = "";
+  window.__responder = (req) => {
+    const all = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    // 被自动化任务唤醒后：先检查现状，再给出结论
+    if (all.includes("这是系统自动唤醒，不是用户输入")) {
+      window.__autoWake = (window.__autoWake || 0) + 1;
+      window.__autoReq = all.slice(-600);
+      return [{ content: "唤醒后已检查页面，继续完成任务。" }];
+    }
+    if (all.includes("把这些页面翻完")) {
+      return [
+        {
+          content:
+            '交给自动化任务。\n```action\n{"action":"automate","name":"翻完所有页面","repeat":20,' +
+            '"intervalMs":400,"steps":[{"op":"click","text":"下一页"},{"op":"wait","ms":300}],' +
+            '"until":{"op":"disabled","text":"下一页"},"maxMs":30000,' +
+            '"instruction":"翻完后检查现在在第几页，并汇报一共翻了几页"}\n```',
+        },
+      ];
+    }
+    return [{ content: "好的。" }];
+  };
+  document.getElementById("input").value = "把这些页面翻完";
+  document.getElementById("sendBtn").click();
+});
+await sleep(1200);
+
+// 自动化任务应当已经在跑：横条显示"自动化任务…"
+const autoChip = await pageB.evaluate(() => {
+  const chip = document.getElementById("deferChip");
+  const host = document.getElementById("chatHost");
+  return {
+    visible: !!chip && getComputedStyle(chip).display !== "none",
+    text: (document.getElementById("deferChipText") || {}).textContent || "",
+    chat: (host ? host.innerText : "").slice(-420),
+  };
+});
+check("自动化任务开始时侧栏显示「运行中」横条", autoChip.visible && /自动化任务/.test(autoChip.text), JSON.stringify(autoChip));
+
+// 等程序跑完循环（点 4 次翻到第 5 页 → 下一页禁用 → 停）
+let autoPage = 0;
+for (let i = 0; i < 40; i++) {
+  autoPage = await pageAuto.evaluate(() => (window.__fixture ? window.__fixture.page : 0));
+  if (autoPage >= 5) break;
+  await sleep(300);
+}
+const autoClicks = await pageAuto.evaluate(() => (window.__fixture ? window.__fixture.clicks : 0));
+const autoLog = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const sessions = all.ai_browser_sessions || [];
+  let best = "";
+  for (const s of sessions) {
+    for (const m of s.messages || []) {
+      const c = typeof m.content === "string" ? m.content : "";
+      if (c.includes("自动化任务") && c.length > best.length) best = c;
+    }
+  }
+  return best.slice(0, 700);
+});
+check(
+  "程序真的在页面里跑了循环（翻到了最后一页）",
+  autoPage >= 5 && autoClicks >= 4,
+  JSON.stringify({ autoPage, autoClicks, log: autoLog.slice(-260) })
+);
+
+// 跑完 → 应当唤醒 AI（侧栏横条消失、并把"跑了多少轮"写进唤醒消息）
+let woke = null;
+for (let i = 0; i < 40; i++) {
+  woke = await pageB.evaluate(() => ({ n: window.__autoWake || 0, chipHidden: document.getElementById("deferChip").classList.contains("hidden") }));
+  if (woke.n > 0) break;
+  await sleep(400);
+}
+check("跑完自动唤醒 AI 继续（只唤醒一次）", woke.n === 1, JSON.stringify(woke));
+const wakeText = await pageB.evaluate(() => window.__autoReq || "");
+check(
+  "唤醒消息里带上了「跑了几轮/为何停」，便于 AI 先检查",
+  /跑了\s*\d+\s*轮/.test(wakeText) || /停止原因/.test(wakeText),
+  wakeText.slice(wakeText.indexOf("自动化任务"), wakeText.indexOf("自动化任务") + 90)
+);
+check("唤醒后横条收起", woke.chipHidden, JSON.stringify(woke));
+
+await pageB.evaluate(() => {
+  window.__responder = null;
+});
+await pageAuto.close().catch(() => {});
+await sleep(300);
 
 // ---------- ⑤ 关标签页 → 工作区消失 + 会话删除 ----------
 // 注意：先按"工作区 id"过滤，跟历史里堆积的会话无关

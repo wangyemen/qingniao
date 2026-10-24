@@ -994,7 +994,11 @@ function syncDeferChip(rt) {
     deferChip.classList.add("hidden");
     return;
   }
-  deferChipText.textContent = `后台任务：${rt.deferLabel(task)}，满足后自动继续`;
+  // 自动化任务用"运行中"的说法，普通后台任务用"等待…满足后自动继续"
+  const isAuto = task.until && task.until.type === "automation";
+  deferChipText.textContent = isAuto
+    ? `🧩 ${rt.deferLabel(task)}`
+    : `后台任务：${rt.deferLabel(task)}，满足后自动继续`;
   deferChipText.title = task.instruction || "";
   deferChip.classList.remove("hidden");
 }

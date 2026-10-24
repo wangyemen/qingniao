@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>自动化任务夹具 · 分页与循环</title>
+  <style>
+    body { font-family: "Microsoft YaHei", sans-serif; padding: 24px; max-width: 720px; }
+    h1 { font-size: 18px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin: 12px 0; }
+    .bar { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+    button { padding: 8px 14px; border-radius: 8px; border: 1px solid #bbb; background: #f7f7f7; cursor: pointer; font: inherit; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    #pageInfo { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>自动化任务夹具</h1>
+  <p class="sub">用于验证：重复性动作交给程序跑循环（翻页 / 循环点击），跑完再唤醒 AI。</p>
+
+  <!-- ① 分页：点「下一页」逐页前进，最后一页按钮禁用 -->
+  <div class="card">
+    <div id="pageInfo">第 1 页 / 共 5 页</div>
+    <div id="pageBody">这是第 1 页的内容。</div>
+    <div class="bar">
+      <button id="prevBtn">上一页</button>
+      <button id="nextBtn">下一页</button>
+      <span id="clicks">点击次数：0</span>
+    </div>
+  </div>
+
+  <!-- ② 循环点击：每点一次计数 +1，点满 3 次后出现「完成」提示 -->
+  <div class="card">
+    <div id="loopState">循环计数：0</div>
+    <div class="bar">
+      <button id="loopBtn">继续</button>
+      <span id="loopDone"></span>
+    </div>
+  </div>
+
+  <script>
+    // —— 分页（共 5 页，到最后一页把"下一页"禁用）——
+    var totalPages = 5;
+    var page = 1;
+    var clicks = 0;
+
+    function renderPage() {
+      document.getElementById("pageInfo").textContent = "第 " + page + " 页 / 共 " + totalPages + " 页";
+      document.getElementById("pageBody").textContent = "这是第 " + page + " 页的内容。";
+      document.getElementById("clicks").textContent = "点击次数：" + clicks;
+      document.getElementById("prevBtn").disabled = page <= 1;
+      document.getElementById("nextBtn").disabled = page >= totalPages;
+    }
+    document.getElementById("nextBtn").addEventListener("click", function () {
+      clicks++;
+      if (page < totalPages) page++;
+      renderPage();
+    });
+    document.getElementById("prevBtn").addEventListener("click", function () {
+      clicks++;
+      if (page > 1) page--;
+      renderPage();
+    });
+
+    // —— 循环点击（点 3 次后出现"完成"）——
+    var loopCount = 0;
+    document.getElementById("loopBtn").addEventListener("click", function () {
+      loopCount++;
+      document.getElementById("loopState").textContent = "循环计数：" + loopCount;
+      if (loopCount >= 3) document.getElementById("loopDone").textContent = "完成";
+    });
+
+    renderPage();
+    // 供测试断言用
+    window.__fixture = {
+      get page() { return page; },
+      get clicks() { return clicks; },
+      get loopCount() { return loopCount; },
+    };
+  </script>
+</body>
+</html>

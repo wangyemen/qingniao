@@ -6,7 +6,7 @@
 //
 // 隔离底线：一个工作区只能读/操作自己 tabIds 里的标签页，别的工作区的标签页一律拒绝。
 
-import { findProvider } from "../lib/storage.js";
+import { findProvider, limitsFor } from "../lib/storage.js";
 import { chatStream } from "../lib/api.js";
 import {
   extractAction,
@@ -698,6 +698,7 @@ export class WorkspaceRuntime {
   deferLabel(task) {
     if (!task || !task.until) return "等待条件满足";
     const u = task.until;
+    if (u.type === "automation") return `自动化任务：${u.name || "未命名"}（程序在跑，跑完叫我）`;
     return u.type === "video-ended"
       ? "等待视频播放结束"
       : u.type === "text-appear"
@@ -887,6 +888,114 @@ export class WorkspaceRuntime {
       };
     }
 
+    // ===== 自动化任务（action: automate）=====
+    //
+    // 用途：把"重复性动作"交给程序跑循环 —— 点一下等两秒循环 3 次、PPT 逐页翻到底等等。
+    // AI 只声明"循环做什么 / 什么时候停"，循环在页面里跑完，再唤醒 AI 检查现状、接着干。
+    //
+    // 实现上就是"用 defer 机制等这个程序跑完"：
+    //   ① 注册一个后台任务（兜底超时 = 程序自己的时长上限 + 30 秒）；
+    //   ② 把 spec 交给页面里的 __aiCtl.automate() 去跑；
+    //   ③ 程序跑完由**页面**直接发 defer:fired → SW 唤醒 AI（不依赖侧栏还活着）。
+    // 判断用的是 action.action（action 是动作对象，不是字符串）
+    if (action.action === "automate" || action.action === "automation" || action.action === "loop") {
+      const steps = Array.isArray(action.steps) ? action.steps.filter((x) => x && typeof x === "object") : [];
+      if (!steps.length) {
+        return {
+          ok: false,
+          msg: "automate 需要 steps（要循环做什么）",
+          hint:
+            '{"action":"automate","name":"翻完所有页面","repeat":80,"intervalMs":700,' +
+            '"steps":[{"op":"click","text":"下一页"},{"op":"wait","ms":400}],' +
+            '"until":{"op":"absent","text":"下一页"},"instruction":"翻完后汇报总页数并总结每一页"}',
+        };
+      }
+      const instruction = String(action.instruction || "").trim();
+      if (!instruction) {
+        return {
+          ok: false,
+          msg: "automate 需要 instruction（跑完唤醒后要做什么）",
+          hint: "比如：跑完后检查现在到第几页，并总结已经翻过的内容",
+        };
+      }
+      const name = String(action.name || "自动化任务").slice(0, 30);
+      const repeat = Math.max(1, Math.min(500, Number(action.repeat) > 0 ? Math.round(Number(action.repeat)) : 1));
+      const maxMs = Math.max(1000, Math.min(600000, Number(action.maxMs) > 0 ? Number(action.maxMs) : 120000));
+
+      const taskId = "auto_" + Math.random().toString(36).slice(2, 10);
+      let timeoutSec = Math.ceil(maxMs / 1000) + 30;
+      try {
+        let winId = null;
+        try {
+          const t = await chrome.tabs.get(tabId);
+          winId = t && t.windowId != null ? t.windowId : null;
+        } catch (_) {}
+        const resp = await chrome.runtime.sendMessage({
+          type: "defer:register",
+          task: {
+            id: taskId,
+            instruction,
+            until: { type: "automation", name, repeat, steps: steps.length },
+            tabId,
+            windowId: winId,
+            workspaceId: this.ws.id,
+            timeoutSec,
+            label: `自动化任务：${name}`,
+          },
+        });
+        if (resp && resp.timeoutSec) timeoutSec = resp.timeoutSec;
+      } catch (err) {
+        return { ok: false, msg: "自动化任务注册失败：" + (err.message || err) };
+      }
+
+      const spec = {
+        taskId,
+        name,
+        repeat,
+        intervalMs: Number(action.intervalMs) >= 0 ? Number(action.intervalMs) : 300,
+        maxMs,
+        steps,
+        until: action.until && typeof action.until === "object" ? action.until : null,
+      };
+
+      // 让界面立刻显示"自动化任务运行中"（与后台任务同一个横条）
+      this.activeDeferTask = {
+        id: taskId,
+        until: { type: "automation", name },
+        label: `自动化任务：${name}（运行中，最多 ${repeat} 轮）`,
+        instruction,
+      };
+      this.ctx.onDeferChange(this);
+      this.setStatus(`自动化任务运行中：${name}`, "busy");
+
+      let pageResult = null;
+      try {
+        await injectScript(tabId, "content/control.js");
+        const [{ result: r }] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (sp) => globalThis.__aiCtl.automate(sp),
+          args: [spec],
+        });
+        pageResult = r && typeof r === "object" ? r : null;
+      } catch (err) {
+        pageResult = { ok: false, msg: "页面中断了这个自动化任务（可能发生了跳转/关页）：" + (err.message || err) };
+      }
+
+      // 页面已经发过 defer:fired 唤醒 AI；这里只负责把结果告诉用户与后续步骤
+      const summary = pageResult
+        ? `自动化任务「${name}」结束：${pageResult.iterations || 0} 轮，停止原因 ${pageResult.stoppedBy || "?"}` +
+          (pageResult.log && pageResult.log.length ? "\n执行记录：\n" + pageResult.log.slice(-12).join("\n") : "")
+        : `自动化任务「${name}」以未知原因结束`;
+      return {
+        ok: true,
+        deferred: true,
+        taskId,
+        automation: true,
+        msg: summary,
+        detail: pageResult || undefined,
+      };
+    }
+
     let beforeUrl = "";
     try {
       const tab = await chrome.tabs.get(tabId);
@@ -906,6 +1015,7 @@ export class WorkspaceRuntime {
         target: { tabId },
         func: (a) => globalThis.__aiCtl.act(a),
         args: [action],
+        // 注：注入函数返回 Promise 时浏览器会自动等待（新版已不允许传 awaitPromise 参数）
       });
       result = r && typeof r === "object" ? r : { ok: false, msg: "页面未响应动作" };
     } catch (err) {
@@ -1020,6 +1130,9 @@ export class WorkspaceRuntime {
     }
     const modelMeta = (provider.models || []).find((m) => m.id === mid);
     const modelVision = !!modelMeta?.vision;
+    // 上限按"这个模型自己的配置"来（不同模型本来就不一样），没配才用全局默认
+    const limits = limitsFor(settings, provider, mid);
+    const modelMaxTokens = limits.maxTokens;
 
     let shotBudget = 2;
     let autoShotUsed = false;
@@ -1224,7 +1337,7 @@ export class WorkspaceRuntime {
         // ===== 记忆压缩（用户要求：快达到总 token 的 90% 就自动压缩）=====
         // 命中后重建一次 messages（用压缩过的历史），保证这次请求不超上限。
         if (!this.compressedThisTurn) {
-          const win = Number(settings.contextWindow) || 128000;
+          const win = limits.contextWindow || 128000;
           const ratio = Math.min(0.98, Math.max(0.5, Number(settings.autoCompressAt) || 0.9));
           if (estimateMessages(messages) >= win * ratio) {
             const okCompress = await this.compressMemory(provider, mid);
@@ -1276,6 +1389,12 @@ export class WorkspaceRuntime {
                     messages,
                     signal: this.abortController.signal,
                     thinkingEnabled: this.ctx.toggleState().think,
+                    // 回复上限：这个模型自己的配置（自动换模型后仍用原模型的，避免换到不支持的值；
+                    // 若换到的模型配了更小的值，这里按"取小"更安全）
+                    maxTokens: Math.min(
+                      modelMaxTokens || 4096,
+                      limitsFor(settings, provider, useModel).maxTokens || modelMaxTokens || 4096
+                    ),
                     onReasoning: (delta) => {
                       reasoningAcc += delta;
                       if (!thinkingOpen) {
