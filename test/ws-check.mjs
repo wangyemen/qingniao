@@ -91,7 +91,12 @@ await pageB.evaluateOnNewDocument(() => {
   window.__lastReq = null;
   window.__failModels = new Set();
   const enc = new TextEncoder();
+  // 保留真实 fetch：只拦截"模型接口"，其余（version.txt、技能市场等）照常放行
+  const realFetch = window.fetch.bind(window);
   window.fetch = async (url, opts) => {
+    const u = String(url || "");
+    // 只拦模型接口，其它请求（version.txt / 技能市场 / 图片…）交给真实 fetch
+    if (!/chat\/completions|\/models/i.test(u)) return realFetch(url, opts);
     let req = null;
     try {
       req = opts && typeof opts.body === "string" ? JSON.parse(opts.body) : null;
@@ -817,6 +822,159 @@ check(
   brandRes.items.length > 0 && brandRes.items.every((x) => x.ok),
   JSON.stringify(brandRes)
 );
+
+// ---------- ⑲ 「/」调用技能：识别 / 变色 / 实际生效 ----------
+// 用户要求：输入 /技能名 时整段换个颜色（一眼看出"用上了"），发送时按技能执行。
+await pageA1.bringToFront();
+await sleep(400);
+await pageB.evaluate(async () => {
+  const mod = await import(chrome.runtime.getURL("lib/storage.js"));
+  await mod.upsertSkill({
+    id: "test-skill",
+    title: "测试技能",
+    description: "端到端测试用",
+    version: "1.0.0",
+    author: "test",
+    tags: ["测试"],
+    icon: "🧪",
+    body: "## 步骤\n1. 这是技能说明书里的独有句子：SKILL_BODY_MARKER。\n",
+    source: "local",
+    enabled: true,
+  });
+});
+await sleep(400);
+
+// 输入 /test-skill → 应当变色（镜像层出现 skill-token）
+await pageB.evaluate(() => {
+  const el = document.getElementById("input");
+  el.value = "/test-skill 只看价格";
+  el.dispatchEvent(new Event("input"));
+});
+await sleep(400);
+const slashState = await pageB.evaluate(() => {
+  const wrap = document.querySelector(".input-wrap");
+  const mirror = document.getElementById("inputMirror");
+  const token = mirror ? mirror.querySelector(".skill-token") : null;
+  const mStyle = token ? getComputedStyle(token) : null;
+  const taStyle = getComputedStyle(document.getElementById("input"));
+  return {
+    mirroring: !!wrap && wrap.classList.contains("mirroring"),
+    tokenText: token ? token.textContent : null,
+    tokenColor: mStyle ? mStyle.color : null,
+    textareaTransparent: taStyle.color.replace(/\s/g, ""),
+    mirrorText: mirror ? mirror.textContent.trim() : "",
+  };
+});
+check("输入 /技能 后整段变色（命中的技能被标出来）", slashState.mirroring && slashState.tokenText === "/test-skill", JSON.stringify(slashState));
+check("未命中的文字保持正常（镜像层接管时 textarea 透明）", slashState.textareaTransparent === "rgba(0,0,0,0)", JSON.stringify(slashState));
+
+// 打一个不存在的技能名 → 不该变色
+await pageB.evaluate(() => {
+  const el = document.getElementById("input");
+  el.value = "/no-such-skill 随便问问";
+  el.dispatchEvent(new Event("input"));
+});
+await sleep(300);
+const noSlash = await pageB.evaluate(() => ({
+  mirroring: document.querySelector(".input-wrap").classList.contains("mirroring"),
+}));
+check("没命中的 /xxx 不变色（走原生输入样式）", !noSlash.mirroring, JSON.stringify(noSlash));
+
+// 发送 /test-skill → 应当按技能执行：气泡显示"使用技能"，请求里带上技能说明书
+await pageB.evaluate(() => {
+  window.__skillReq = null;
+  window.__responder = (req) => {
+    const all = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    if (all.includes("SKILL_BODY_MARKER")) window.__skillReq = all;
+    return [{ content: "技能已执行。" }];
+  };
+  const el = document.getElementById("input");
+  el.value = "/test-skill 只看价格";
+  el.dispatchEvent(new Event("input"));
+  document.getElementById("sendBtn").click();
+});
+await sleep(2500);
+const slashSend = await pageB.evaluate(() => {
+  const host = document.getElementById("chatHost");
+  const txt = host ? host.innerText : "";
+  const el = document.getElementById("input");
+  return {
+    usedSkillBubble: /使用技能：测试技能/.test(txt),
+    restKept: /只看价格/.test(txt),
+    bodySent: !!window.__skillReq,
+    // 气泡里不该把整份说明书糊出来
+    leakedBody: /SKILL_BODY_MARKER/.test(txt),
+    inputCleared: el.value === "",
+  };
+});
+check("发送 /技能 时按技能执行（气泡显示用了哪个技能）", slashSend.usedSkillBubble && slashSend.inputCleared, JSON.stringify(slashSend));
+check("技能说明书确实发给了模型，且带上补充要求", slashSend.bodySent && slashSend.restKept, JSON.stringify(slashSend));
+check("气泡里不显示整份说明书（只显示技能名）", !slashSend.leakedBody, JSON.stringify(slashSend));
+
+await pageB.evaluate(async () => {
+  window.__responder = null;
+  const mod = await import(chrome.runtime.getURL("lib/storage.js"));
+  await mod.deleteSkill("test-skill");
+});
+
+// ---------- ⑳ version.txt 可解析 + 更新弹窗 ----------
+const vtRes = await pageB.evaluate(async () => {
+  const mod = await import(chrome.runtime.getURL("lib/updates.js"));
+  const vt = await mod.loadLocalVersionTxt();
+  if (!vt) return { ok: false };
+  const between = mod.changelogBetween(vt, "0.5.5", "0.7.0");
+  return {
+    ok: true,
+    latest: vt.latest,
+    entries: (vt.entries || []).length,
+    betweenVersions: between.map((e) => e.version),
+    newerThanSelf: mod.newerThan(vt, "0.1.0"),
+  };
+});
+check("随包的 version.txt 能解析出版本与日志", vtRes.ok && vtRes.entries >= 5, JSON.stringify(vtRes));
+check("更新日志能按版本区间取（用于弹窗）", vtRes.betweenVersions.includes("0.7.0") && vtRes.betweenVersions.includes("0.6.0"), JSON.stringify(vtRes));
+
+const modalRes = await pageB.evaluate(async () => {
+  const KEY = "ai_update_state";
+  const got = await chrome.storage.local.get(KEY);
+  const st = got[KEY] || {};
+  // 模拟"上次看到的是旧版本" → 重新打开侧栏应当自动弹出更新日志
+  await chrome.storage.local.set({ [KEY]: { ...st, seenVersion: "0.1.0", checkedAt: Date.now() } });
+  return { ok: true };
+});
+check("可以写入「上次看到的版本」（更新提醒的状态）", modalRes.ok, JSON.stringify(modalRes));
+
+// 真的重载一次面板，验证弹窗会自动出现，且内容里有更新条目
+await pageB.reload({ waitUntil: "load" });
+await sleep(2600);
+const updateModalRes = await pageB.evaluate(() => {
+  const modal = document.getElementById("updateModal");
+  const visible = !!modal && !modal.classList.contains("hidden");
+  const body = document.getElementById("updateBody");
+  const title = document.getElementById("updateTitle");
+  return {
+    visible,
+    title: title ? title.textContent : "",
+    hasEntry: !!(body && /0\.7\.0|0\.6\.0/.test(body.innerText || "")),
+    bodyLen: body ? (body.innerText || "").length : 0,
+  };
+});
+check("扩展更新后侧栏自动弹出更新日志", updateModalRes.visible && updateModalRes.hasEntry, JSON.stringify(updateModalRes));
+
+// 关掉弹窗 → 记住"已看到这一版"，并且不再显示
+await pageB.evaluate(() => {
+  document.getElementById("updateSeenBtn").click();
+});
+await sleep(2600);
+const afterSeen = await pageB.evaluate(async () => {
+  const modal = document.getElementById("updateModal");
+  const got = await chrome.storage.local.get("ai_update_state");
+  return {
+    hidden: !!modal && modal.classList.contains("hidden"),
+    seen: (got.ai_update_state || {}).seenVersion,
+  };
+});
+check("关掉后记住版本、不再重复弹", afterSeen.hidden, JSON.stringify(afterSeen));
 
 // ---------- ⑤ 关标签页 → 工作区消失 + 会话删除 ----------
 // 注意：先按"工作区 id"过滤，跟历史里堆积的会话无关

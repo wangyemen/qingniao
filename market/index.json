@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "generatedAt": "2026-10-24T14:54:23.702Z",
+  "repo": "https://github.com/wangyemen/qingniao",
+  "count": 5,
+  "skills": [
+    {
+      "id": "form-fill",
+      "title": "智能填表",
+      "description": "把用户给的信息填进页面表单，逐项核对后再提交",
+      "version": "1.0.0",
+      "author": "青鸟",
+      "tags": [
+        "操作",
+        "表单",
+        "通用"
+      ],
+      "icon": "✍️",
+      "file": "skills/form-fill/SKILL.md",
+      "path": "market/skills/form-fill/SKILL.md",
+      "bytes": 1654,
+      "lines": 18
+    },
+    {
+      "id": "night-watch",
+      "title": "守候与抢时机",
+      "description": "盯着一个页面等条件出现（放号、开售、补货、名额），满足就立刻动手",
+      "version": "1.0.0",
+      "author": "青鸟",
+      "tags": [
+        "后台任务",
+        "自动化",
+        "抢票"
+      ],
+      "icon": "🌙",
+      "file": "skills/night-watch/SKILL.md",
+      "path": "market/skills/night-watch/SKILL.md",
+      "bytes": 1909,
+      "lines": 22
+    },
+    {
+      "id": "page-summary",
+      "title": "页面摘要",
+      "description": "读懂当前页面，给出结构化要点与下一步建议",
+      "version": "1.0.0",
+      "author": "青鸟",
+      "tags": [
+        "阅读",
+        "摘要",
+        "通用"
+      ],
+      "icon": "📄",
+      "file": "skills/page-summary/SKILL.md",
+      "path": "market/skills/page-summary/SKILL.md",
+      "bytes": 1495,
+      "lines": 17
+    },
+    {
+      "id": "price-compare",
+      "title": "比价选型",
+      "description": "在多个页面/标签页收集同类商品信息，汇总成一张可比较的表",
+      "version": "1.0.0",
+      "author": "青鸟",
+      "tags": [
+        "购物",
+        "比价",
+        "多工作区"
+      ],
+      "icon": "🧮",
+      "file": "skills/price-compare/SKILL.md",
+      "path": "market/skills/price-compare/SKILL.md",
+      "bytes": 1672,
+      "lines": 19
+    },
+    {
+      "id": "video-course",
+      "title": "网课/视频陪读",
+      "description": "一边播视频一边记笔记，等这集结束再接下一集",
+      "version": "1.0.0",
+      "author": "青鸟",
+      "tags": [
+        "学习",
+        "视频",
+        "后台任务"
+      ],
+      "icon": "🎬",
+      "file": "skills/video-course/SKILL.md",
+      "path": "market/skills/video-course/SKILL.md",
+      "bytes": 1614,
+      "lines": 17
+    }
+  ]
+}

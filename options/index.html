@@ -6,6 +6,7 @@
   <title>青鸟 · 设置</title>
   <link rel="icon" href="../assets/icon32.png" />
   <link rel="stylesheet" href="options.css" />
+  <link rel="stylesheet" href="market.css" />
 </head>
 <body>
   <div class="wrap">
@@ -18,6 +19,12 @@
       <p class="sub">青鸟殷勤为探看。管理供应商、模型与 API Key；同一供应商可添加多个 Key，请求失败时自动切换，重试仍失败会自动换下一个模型。</p>
     </header>
 
+    <nav class="page-nav" role="tablist">
+      <button class="nav-item active" data-pane="settings" role="tab">供应商与选项</button>
+      <button class="nav-item" data-pane="skills" role="tab">技能市场</button>
+    </nav>
+
+    <div id="pane-settings">
     <section class="panel">
       <div class="panel-head">
         <h2>供应商</h2>
@@ -61,13 +68,125 @@
         以免超出模型上限。默认 128000 tokens / 90%。
       </p>
     </section>
+    </div><!-- /pane-settings -->
+
+    <!-- ===================== 技能市场 ===================== -->
+    <div id="pane-skills" class="hidden">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>在线市场</h2>
+          <button id="fetchBtn" class="primary">获取技能</button>
+        </div>
+        <p class="hint">
+          技能就是一份写给 AI 看的操作说明书：什么时候用、按什么步骤做、哪些不能做。
+          装到本地后，在侧栏点「技能」就能让它照着干。
+        </p>
+        <div class="row market-toolbar">
+          <label class="field grow">
+            <span>技能来源（GitHub 仓库地址或市场目录地址）</span>
+            <input type="text" id="sourceInput" placeholder="https://github.com/wangyemen/qingniao" />
+          </label>
+          <button id="resetSourceBtn" class="tiny" title="恢复默认仓库">默认来源</button>
+        </div>
+        <div class="market-meta-row">
+          <span class="hint" id="marketMeta">尚未同步</span>
+          <input type="search" id="marketSearch" class="search" placeholder="搜索技能…" />
+        </div>
+        <div id="marketList" class="cards"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>我的技能</h2>
+          <div class="row">
+            <button id="newSkillBtn" class="primary">新建技能</button>
+            <button id="exportAllBtn" class="tiny">全部导出</button>
+          </div>
+        </div>
+        <p class="hint" id="mineMeta"></p>
+        <div id="mineList" class="cards"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>新建 / 编辑技能</h2>
+          <div class="row">
+            <button id="edSaveBtn" class="primary">保存到我的技能</button>
+          </div>
+        </div>
+        <div class="row">
+          <label class="field grow">
+            <span>技能 id（小写字母/数字/连字符）</span>
+            <input type="text" id="edId" placeholder="my-skill" />
+          </label>
+          <label class="field grow">
+            <span>显示名</span>
+            <input type="text" id="edTitle" placeholder="我的技能" />
+          </label>
+        </div>
+        <div class="row">
+          <label class="field grow">
+            <span>一句话说明（显示在列表里）</span>
+            <input type="text" id="edDesc" placeholder="它替你做什么" />
+          </label>
+          <label class="field"><span>版本</span><input type="text" id="edVersion" placeholder="1.0.0" /></label>
+          <label class="field"><span>作者</span><input type="text" id="edAuthor" placeholder="你的名字" /></label>
+          <label class="field"><span>图标</span><input type="text" id="edIcon" placeholder="🧩" /></label>
+        </div>
+        <div class="row">
+          <label class="field grow">
+            <span>标签（逗号分隔）</span>
+            <input type="text" id="edTags" placeholder="阅读, 摘要" />
+          </label>
+        </div>
+
+        <div class="editor">
+          <div class="editor-col">
+            <div class="editor-head">
+              <span>SKILL.md 正文（Markdown）</span>
+              <span class="hint" id="edStats"></span>
+            </div>
+            <textarea id="edBody" spellcheck="false" placeholder="## 什么时候用
+...
+
+## 步骤
+1. ...
+
+## 注意
+..."></textarea>
+          </div>
+          <div class="editor-col">
+            <div class="editor-head"><span>预览</span></div>
+            <div id="edPreview" class="preview md"></div>
+          </div>
+        </div>
+
+        <div class="row" style="justify-content: space-between; align-items: center">
+          <span class="hint" id="edHint"></span>
+          <div class="row">
+            <button id="edCopyBtn" class="tiny">复制 .md</button>
+            <button id="edDownloadBtn" class="tiny">下载 .md</button>
+            <button id="edPublishHelpBtn" class="tiny" title="复制内容并打开 GitHub 新建文件页">提交到市场</button>
+            <button id="edClearBtn" class="tiny">清空</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>更新日志</h2></div>
+        <p class="hint">扩展更新后侧栏会自动弹出变更说明；这里随时可以回看。</p>
+        <div id="changelogBox" class="preview md"></div>
+      </section>
+    </div><!-- /pane-skills -->
 
     <footer class="page-foot">
       <span id="saveStatus" class="save-status"></span>
+      <span id="marketStatus" class="status"></span>
       <button id="saveBtn" class="primary">保存设置</button>
     </footer>
   </div>
 
   <script type="module" src="options.js"></script>
+  <script type="module" src="market.js"></script>
 </body>
 </html>

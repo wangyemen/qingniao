@@ -1113,6 +1113,178 @@ textarea::placeholder {
   align-items: center;
   gap: 8px;
 }
+
+/* ===== 输入框 + 「/技能」高亮镜像层 =====
+   命中技能时：textarea 文字透明（只留光标），由镜像层按同样的排版渲染，并把技能染色。
+   没命中时镜像层为空、textarea 正常显示 —— 完全走原生路径，不留任何对齐风险。
+   ⚠️ 镜像层的 padding / line-height / 字体必须与 textarea 完全一致，否则文字会错位。 */
+.input-wrap { position: relative; }
+
+.input-wrap textarea { position: relative; z-index: 1; background: transparent; }
+
+.input-mirror {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: none;
+  pointer-events: none;
+  padding: 2px 2px 6px;      /* 与 textarea 一致 */
+  line-height: 1.6;          /* 与 textarea 一致 */
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  color: transparent;
+}
+
+/* 命中技能：镜像层接管文字渲染 */
+.input-wrap.mirroring .input-mirror { display: block; color: var(--text); }
+.input-wrap.mirroring textarea { color: transparent; caret-color: var(--text); }
+.input-wrap.mirroring textarea::selection { background: rgba(45, 212, 191, 0.28); }
+
+/* 命中的 /技能：换色，一眼看出"真的用上了" */
+.input-mirror .skill-token {
+  color: var(--accent-2);
+  background: rgba(45, 212, 191, 0.14);
+  border-radius: 5px;
+  box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.35);
+  font-weight: 600;
+}
+
+/* ===== 「/」技能补全菜单 ===== */
+.composer-box { position: relative; }
+.slash-menu {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(100% + 6px);
+  z-index: 20;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  padding: 6px;
+  max-height: 240px;
+  overflow: auto;
+  animation: fadeUp 0.16s var(--ease);
+}
+.slash-head {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  padding: 2px 6px 6px;
+  letter-spacing: 0.3px;
+}
+.slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: var(--text);
+  cursor: pointer;
+}
+.slash-item:hover { background: var(--accent-soft); }
+.slash-id {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  color: var(--accent-2);
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.slash-title {
+  font-size: 12px;
+  color: var(--text-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== 更新提醒弹窗 ===== */
+.update-modal-back {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  animation: fadeUp 0.2s var(--ease);
+}
+.update-modal {
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  width: 100%;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  gap: 10px;
+}
+.update-head { display: flex; align-items: flex-start; gap: 10px; }
+.update-head img { width: 34px; height: 34px; border-radius: 10px; flex: 0 0 auto; }
+.update-head-text { flex: 1; min-width: 0; }
+.update-head-text h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.update-sub { margin: 2px 0 0; font-size: 11.5px; color: var(--text-soft); }
+.update-body {
+  overflow: auto;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+.update-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.update-link { color: var(--accent-2); font-size: 12px; text-decoration: none; }
+.update-link:hover { text-decoration: underline; }
+
+/* ===== 技能挑选面板 ===== */
+.skill-picker {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 62px;
+  z-index: 25;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 10px;
+  animation: fadeUp 0.18s var(--ease);
+}
+.skill-picker-head { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--text-soft); }
+.skill-picker-head span:first-child { flex: 1; }
+.skill-list { max-height: 300px; overflow: auto; margin: 8px 0; display: flex; flex-direction: column; gap: 4px; }
+.skill-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 7px 9px;
+  cursor: pointer;
+  color: var(--text);
+}
+.skill-item:hover { background: rgba(255, 255, 255, 0.04); }
+.skill-item.active { background: var(--accent-soft); border-color: rgba(45, 212, 191, 0.35); }
+.skill-item-icon { font-size: 15px; flex: 0 0 auto; }
+.skill-item-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.skill-item-text b { font-size: 12.5px; font-weight: 600; }
+.skill-item-text small { font-size: 11px; color: var(--text-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-item-ver { font-size: 10.5px; color: var(--text-faint); flex: 0 0 auto; }
+.skill-picker-foot { display: flex; gap: 6px; align-items: center; }
+.skill-picker-foot input { flex: 1; }
+.skill-empty { font-size: 12px; color: var(--text-soft); line-height: 1.8; padding: 6px 4px; }
 .status {
   flex: 1;
   color: var(--text-soft);

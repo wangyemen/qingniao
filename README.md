@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.6.1-2dd4bf" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-2dd4bf" />
   <img alt="manifest" src="https://img.shields.io/badge/Manifest-V3-2dd4bf" />
   <img alt="chrome" src="https://img.shields.io/badge/Chrome-%E2%89%A5%20116-2dd4bf" />
 </p>
@@ -56,6 +56,19 @@
 - **记忆自动压缩**：上下文用到设定比例（默认 90%）时，自动把较早的历史压成摘要、保留最近几轮，继续干活；
 - **跨面板自愈**：Chrome 侧栏是"每个标签页一份文档"，扩展会把会话、后台任务、运行状态都放在共享存储里同步——切走再切回来，看到的就是最新的。
 
+### 技能市场：把"怎么干"写成可复用的说明书
+- **技能**就是一份写给 AI 看的 Markdown 说明书：什么时候用、按什么步骤做、哪些不能做——不写代码；
+- **在线市场**（在设置页的「技能市场」标签里）自动从[本仓库的 `market/`](market/)拉取技能目录，可浏览、搜索、一键安装；
+- **装到本地**后存在本机，可启用/停用、在线编辑 Markdown 并保存、导出 `.md`、也可以**新建自己的技能**；
+- **怎么用**：在侧栏输入框打 `/`，会列出技能；打 `/page-summary` 这类命令，**命中的技能会整段变色**，一眼看出"用上了"；回车即按技能执行；
+- 也可以点侧栏工具栏的「技能」按钮挑选（可补一句具体要求），或在设置页把「发给 AI 的指令」复制出来自己粘；
+- 内置技能：页面摘要、智能填表、网课陪读、比价选型、守候与抢时机。**想贡献技能？** 见 [`market/README.md`](market/README.md)。
+
+### 更新提醒
+- 扩展更新后，侧栏会**自动弹出更新日志**（读随包的 [`version.txt`](version.txt)，不依赖网络）；
+- 联网时还会对比仓库里的 `version.txt`，发现更新的版本就提示你，并在工具栏图标上打一个「新」标记；
+- 设置页的「技能市场」标签下随时可以回看完整更新日志。
+
 ### 模型与厂商
 - 兼容 OpenAI 格式的接口，可添加多个供应商；
 - 模型可选、每个工作区可以不同、也可以在任务中途改；
@@ -89,16 +102,26 @@
 
 ```
 manifest.json          MV3 清单
+version.txt            更新日志（随包发布，也用于联网检查新版本）
 background/            service worker：工作区注册表、后台任务表、面板清理
 content/               注入脚本：页面读取与操作（多策略点击/填写/滚动等）
-lib/                   存储、API 调用、模型协议、Markdown、工具函数
+lib/                   存储、API 调用、模型协议、技能解析、更新检查、Markdown、工具函数
 sidepanel/             侧边栏界面：index.html / sidepanel.js / workspace.js / css
-options/               设置页
+options/               设置页：供应商与选项 + 技能市场（market.js / market.css）
+market/                发布到 GitHub 的在线技能目录：index.json + skills/<id>/SKILL.md
 assets/                图标（16/32/48/128）与 Logo
 brand/                 Logo 设计源图与生成脚本
 test/                  端到端测试与本地页面夹具
 docs/                  设计与调研笔记
 ```
+
+## 往技能市场加技能
+
+1. 在 `market/skills/` 下新建 `<技能 id>/SKILL.md`（带 frontmatter：name/title/description/version/author/tags/icon）；
+2. 跑 `node market/build-index.mjs` 重新生成 `market/index.json`；
+3. 提交 PR，合并后所有人的「技能市场」里就能看到并安装它。
+
+也可以直接在扩展里写（设置页 → 技能市场 → 新建 / 编辑），再点「提交到市场」把内容复制出来提 PR。
 
 ## 开发与测试
 

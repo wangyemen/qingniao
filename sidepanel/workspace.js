@@ -1143,7 +1143,10 @@ export class WorkspaceRuntime {
     if (screenshotDataUrl) noteBits.push("屏幕截图");
     const attachNote = noteBits.length ? "[附带：" + noteBits.join("、") + "，图片仅本条消息可见]" : "";
 
-    const displayText = isWake ? (opts.displayText || text) : text || "（附件内容）";
+    // 气泡里显示什么：优先用调用方给的 displayText（后台唤醒、"/技能"这类
+// "真实请求很长、但界面上只需一句话"的情况），否则就是用户自己打的字。
+    // 注意：存进会话的仍然是完整的 text（模型需要看到完整指令）。
+    const displayText = opts.displayText || text || "（附件内容）";
     this.createUserBubble(displayText, { attachNote });
 
     this.session.messages.push({ role: "user", content: text || displayText, attachNote });

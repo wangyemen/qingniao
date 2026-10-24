@@ -26,8 +26,20 @@ import {
   loadWorkspaces,
   saveWorkspaces,
   newWorkspace,
+  loadSkills,
+  loadMarketSettings,
 } from "../lib/storage.js";
+import { buildSkillPrompt } from "../lib/skills.js";
+import {
+  UPDATE_STATE_KEY,
+  loadLocalVersionTxt,
+  loadRemoteVersionTxt,
+  changelogBetween,
+  newerThan,
+  parseVersionTxt,
+} from "../lib/updates.js";
 import { processFile, imagesFromClipboard } from "../lib/attach.js";
+import { renderMarkdown } from "../lib/markdown.js";
 import { WorkspaceRuntime, noteOpenedTab } from "./workspace.js";
 
 const chatHost = document.getElementById("chatHost");
@@ -58,6 +70,22 @@ const deferChipText = document.getElementById("deferChipText");
 const deferCancelBtn = document.getElementById("deferCancelBtn");
 const wsBarEl = document.getElementById("wsBar");
 const mergeBarEl = document.getElementById("mergeBar");
+const skillsBtn = document.getElementById("skillsBtn");
+const skillPickerEl = document.getElementById("skillPicker");
+const skillListEl = document.getElementById("skillList");
+const skillMarketBtn = document.getElementById("skillMarketBtn");
+const skillPickerCloseBtn = document.getElementById("skillPickerCloseBtn");
+const skillRunBtn = document.getElementById("skillRunBtn");
+const skillExtraEl = document.getElementById("skillExtra");
+const inputMirror = document.getElementById("inputMirror");
+const slashMenuEl = document.getElementById("slashMenu");
+const updateModal = document.getElementById("updateModal");
+const updateTitle = document.getElementById("updateTitle");
+const updateSub = document.getElementById("updateSub");
+const updateBody = document.getElementById("updateBody");
+const updateSeenBtn = document.getElementById("updateSeenBtn");
+const updateCloseBtn = document.getElementById("updateCloseBtn");
+const updateRepoLink = document.getElementById("updateRepoLink");
 
 // ===== 全局状态 =====
 let settings = null;
@@ -215,6 +243,10 @@ async function init() {
   await restoreWorkspaces();
   await refreshActive();
 
+  // 技能缓存 + 更新提醒（都不阻塞界面）
+  refreshSkillsCache().catch(() => {});
+  setTimeout(() => checkUpdates().catch(() => {}), 900);
+
   sendBtn.addEventListener("click", () => {
     const rt = activeRuntime();
     if (rt && rt.busy) {
@@ -240,6 +272,32 @@ async function init() {
   settingsBtn.addEventListener("click", () => chrome.runtime.openOptionsPage());
   historyBtn.addEventListener("click", openHistory);
   historyCloseBtn.addEventListener("click", () => historyPanel.classList.add("hidden"));
+
+  // 技能：点一下挑一个用；右键/长按直接开技能市场
+  skillsBtn.addEventListener("click", () => toggleSkillPicker());
+  skillsBtn.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openSkillMarket();
+  });
+  skillPickerCloseBtn.addEventListener("click", () => skillPickerEl.classList.add("hidden"));
+  skillMarketBtn.addEventListener("click", openSkillMarket);
+  skillRunBtn.addEventListener("click", () => runSelectedSkill());
+
+  // 更新弹窗
+  updateSeenBtn.addEventListener("click", closeUpdateModal);
+  updateCloseBtn.addEventListener("click", closeUpdateModal);
+  updateModal.addEventListener("click", (e) => {
+    if (e.target === updateModal) closeUpdateModal();
+  });
+
+  // 技能在别处被改动（设置页里装的/停用的）→ 本页缓存跟着更新
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.ai_skills) {
+      refreshSkillsCache().then(() => {
+        if (!skillPickerEl.classList.contains("hidden")) renderSkillPicker();
+      });
+    }
+  });
 
   ctxToggle.addEventListener("change", async () => {
     await patchSettings({ contextEnabled: ctxToggle.checked });
@@ -282,16 +340,43 @@ async function init() {
     }
   });
   inputEl.addEventListener("keydown", (e) => {
+    // Tab：把正在输入的 /部分技能名 补全成完整技能
+    if (e.key === "Tab" && !slashMenuEl.classList.contains("hidden")) {
+      const first = slashMatches[0];
+      if (first) {
+        e.preventDefault();
+        applySlashSuggestion(first);
+        return;
+      }
+    }
+    // Esc：收起技能提示
+    if (e.key === "Escape" && !slashMenuEl.classList.contains("hidden")) {
+      e.preventDefault();
+      slashMenuEl.classList.add("hidden");
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       const rt = activeRuntime();
       if (!rt || !rt.busy) onSend();
     }
   });
-  // 输入框内容按工作区暂存
+  // 输入框内容按工作区暂存 + 实时刷新"/技能"高亮与补全
   inputEl.addEventListener("input", () => {
     if (activeWsId) drafts.set(activeWsId, inputEl.value);
     else drafts.set("__pending__", inputEl.value);
+    autoGrowInput();
+    updateInputHighlight();
+    updateSlashMenu();
+  });
+  inputEl.addEventListener("blur", () => setTimeout(() => slashMenuEl.classList.add("hidden"), 150));
+  inputEl.addEventListener("focus", () => {
+    updateInputHighlight();
+    updateSlashMenu();
+  });
+  // 镜像层与 textarea 必须完全重合：自动增高 + 滚动同步
+  inputEl.addEventListener("scroll", () => {
+    inputMirror.scrollTop = inputEl.scrollTop;
   });
 
   deferCancelBtn.addEventListener("click", () => {
@@ -380,8 +465,13 @@ async function init() {
     if (msg.type === "ws:send" && msg.wsId && msg.text) {
       const rt = ownerOfWorkspace(msg.wsId);
       if (!rt) return;
-      if (rt.busy) rt.pendingSends.push({ text: msg.text, attachments: msg.attachments || [] });
-      else rt.send({ text: msg.text, attachments: msg.attachments || [] }).catch(() => {});
+      const payload = {
+        text: msg.text,
+        displayText: msg.displayText,
+        attachments: msg.attachments || [],
+      };
+      if (rt.busy) rt.pendingSends.push(payload);
+      else rt.send(payload).catch(() => {});
     }
   });
 
@@ -968,6 +1058,11 @@ function onTabRemoved(tabId) {
 // ===== 发送 =====
 async function onSend() {
   const text = inputEl.value.trim();
+  // 命中 "/技能" → 换成带技能说明书的正式请求（显示上仍只写"使用了哪个技能"）
+  const asSkill = extractSkillSend(text);
+  const sendText = asSkill ? asSkill.prompt : text;
+  const displayText = asSkill ? asSkill.displayText : undefined;
+  slashMenuEl.classList.add("hidden");
   // 先按"用户此刻所在的标签页"决定发给哪份工作区：
   // 它可能属于某份工作区（那就是切过去继续那份对话），也可能还没归属（新建一份）。
   const curTabId = pendingTabId;
@@ -990,10 +1085,11 @@ async function onSend() {
     newRt.attachments = currentAttachments();
     pendingAttachments = [];
     inputEl.value = "";
+    updateInputHighlight();
     const atts = newRt.attachments.slice();
     newRt.attachments = [];
     renderAttachments(newRt);
-    await newRt.send({ text, attachments: atts });
+    await newRt.send({ text: sendText, displayText, attachments: atts });
     return;
   }
 
@@ -1007,11 +1103,13 @@ async function onSend() {
     rt.attachments = [];
     renderAttachments(rt);
     inputEl.value = "";
+    updateInputHighlight();
     try {
       chrome.runtime.sendMessage({
         type: "ws:send",
         wsId: rt.ws.id,
-        text,
+        text: sendText,
+        displayText,
         attachments: atts,
       }).catch(() => {});
     } catch (_) {}
@@ -1020,10 +1118,11 @@ async function onSend() {
   }
 
   inputEl.value = "";
+  updateInputHighlight();
   const atts = rt.attachments.slice();
   rt.attachments = [];
   renderAttachments(rt);
-  await rt.send({ text, attachments: atts });
+  await rt.send({ text: sendText, displayText, attachments: atts });
 }
 
 // 未建工作区时，附件先存在一个临时数组里
@@ -1340,7 +1439,382 @@ function syncAutoToggle() {
   if (!on) autoToggle.checked = false;
 }
 
+// ===== 「/」调用技能 =====
+//
+// 用户可以在输入框里直接打 /技能名（如 /page-summary 或 /页面摘要），
+// 命中已启用的技能时：① 整段变成高亮色，让你一眼看出"用上了"；
+//                    ② 发送时自动换成"带技能说明书"的正式请求。
+// 没命中就只是普通文字（保持原样，不变色）。
+
+// 找出文本里第一个命中的 "/技能"，返回 { skill, start, end, rest }
+function findSkillToken(text) {
+  const s = String(text || "");
+  const re = /\/([A-Za-z0-9_\-\u4e00-\u9fa5]+)/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const token = m[1];
+    const lower = token.toLowerCase();
+    const skill = enabledSkills().find(
+      (k) => k.id.toLowerCase() === lower || String(k.title || "").toLowerCase() === lower
+    );
+    if (skill) {
+      const rest = (s.slice(0, m.index) + " " + s.slice(m.index + m[0].length)).trim();
+      return { skill, token, start: m.index, end: m.index + m[0].length, rest };
+    }
+  }
+  return null;
+}
+
+// 正在输入中的"/前缀"（用于补全菜单）：取光标所在的那个词
+function currentSlashQuery() {
+  const s = inputEl.value;
+  const upto = s.slice(0, inputEl.selectionStart == null ? s.length : inputEl.selectionStart);
+  const m = /(?:^|\s)\/([A-Za-z0-9_\-\u4e00-\u9fa5]*)$/.exec(upto);
+  return m ? { query: m[1], at: m.index + m[0].indexOf("/") } : null;
+}
+
+function updateInputHighlight() {
+  const wrap = inputEl.parentElement;
+  const hit = findSkillToken(inputEl.value);
+  if (!hit) {
+    // 没命中：完全走原生 textarea（不换色、不套镜像层，避免任何对齐问题）
+    wrap.classList.remove("mirroring");
+    inputMirror.textContent = "";
+    return;
+  }
+  // 命中：用镜像层渲染（textarea 文字透明，只留光标），把命中的技能染成主色
+  const v = inputEl.value;
+  const before = escapeHtml(v.slice(0, hit.start));
+  const token = escapeHtml(v.slice(hit.start, hit.end));
+  const after = escapeHtml(v.slice(hit.end));
+  inputMirror.innerHTML =
+    before + `<span class="skill-token">${token}</span>` + after + "\n";
+  wrap.classList.add("mirroring");
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+let slashMatches = [];
+
+function updateSlashMenu() {
+  const cur = currentSlashQuery();
+  if (!cur) {
+    slashMenuEl.classList.add("hidden");
+    slashMatches = [];
+    return;
+  }
+  const q = cur.query.toLowerCase();
+  const list = enabledSkills().filter((s) => {
+    if (!q) return true;
+    return (
+      s.id.toLowerCase().includes(q) ||
+      String(s.title || "").toLowerCase().includes(q) ||
+      String(s.description || "").toLowerCase().includes(q)
+    );
+  });
+  slashMatches = list.slice(0, 8);
+  if (!slashMatches.length) {
+    slashMenuEl.classList.add("hidden");
+    return;
+  }
+  slashMenuEl.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "slash-head";
+  head.textContent = q ? `技能匹配「${cur.query}」` : "输入技能名，Tab 补全";
+  slashMenuEl.appendChild(head);
+  for (const s of slashMatches) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "slash-item";
+    item.innerHTML =
+      `<span class="slash-id">/${escapeHtml(s.id)}</span>` +
+      `<span class="slash-title">${escapeHtml(s.title || "")}</span>`;
+    item.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      applySlashSuggestion(s);
+    });
+    slashMenuEl.appendChild(item);
+  }
+  slashMenuEl.classList.remove("hidden");
+}
+
+// 把当前正在输入的 /前缀 替换成完整技能名
+function applySlashSuggestion(skill) {
+  const cur = currentSlashQuery();
+  const v = inputEl.value;
+  if (cur) {
+    const before = v.slice(0, cur.at);
+    const after = v.slice(inputEl.selectionStart == null ? v.length : inputEl.selectionStart);
+    inputEl.value = before + "/" + skill.id + " " + after.replace(/^\s*/, "");
+  } else {
+    inputEl.value = v + (v && !/\s$/.test(v) ? " " : "") + "/" + skill.id + " ";
+  }
+  slashMenuEl.classList.add("hidden");
+  updateInputHighlight();
+  inputEl.focus();
+  const pos = inputEl.value.length;
+  try {
+    inputEl.setSelectionRange(pos, pos);
+  } catch (_) {}
+}
+
+// 发送时：如果消息里有 "/技能"，换成正式请求
+function extractSkillSend(text) {
+  const hit = findSkillToken(text);
+  if (!hit) return null;
+  return {
+    skill: hit.skill,
+    prompt: buildSkillPrompt(hit.skill, hit.rest),
+    displayText: `🧩 使用技能：${hit.skill.title || hit.skill.id}${hit.rest ? "（" + hit.rest + "）" : ""}`,
+  };
+}
+
+// 输入框自动增高（最多占到面板高度的 40%）。
+// 为什么要它：镜像层与 textarea 用同一个盒子，只有**不内部滚动**时两者才严格重合；
+// 超过上限后由下面 scroll 事件把镜像层的滚动位置同步过去。
+function autoGrowInput() {
+  try {
+    inputEl.style.height = "auto";
+    const max = Math.max(60, Math.round(window.innerHeight * 0.4));
+    const h = Math.min(inputEl.scrollHeight, max);
+    inputEl.style.height = h + "px";
+    inputMirror.scrollTop = inputEl.scrollTop;
+  } catch (_) {}
+}
+
 function setStatus(text, kind) {
   statusEl.textContent = text || "";
   statusEl.className = "status" + (kind ? " " + kind : "");
+}
+
+// ===== 技能 =====
+//
+// 技能 = 一份写给 AI 看的 Markdown 说明书。数据存在 chrome.storage.local（ai_skills），
+// 技能市场页面（skills/index.html）负责安装与编辑；这里只负责"挑一个用"。
+
+let skillsCache = {};
+let pickedSkillId = null;
+
+async function refreshSkillsCache() {
+  try {
+    skillsCache = await loadSkills();
+  } catch (_) {
+    skillsCache = {};
+  }
+  return skillsCache;
+}
+
+function enabledSkills() {
+  return Object.values(skillsCache)
+    .filter((s) => s && s.enabled !== false && (s.body || "").trim())
+    .sort((a, b) => (a.title || a.id).localeCompare(b.title || b.id, "zh"));
+}
+
+function toggleSkillPicker() {
+  const hidden = skillPickerEl.classList.contains("hidden");
+  if (!hidden) {
+    skillPickerEl.classList.add("hidden");
+    return;
+  }
+  historyPanel.classList.add("hidden");
+  renderSkillPicker();
+  skillPickerEl.classList.remove("hidden");
+  skillExtraEl.focus();
+}
+
+function renderSkillPicker() {
+  skillListEl.innerHTML = "";
+  const list = enabledSkills();
+  if (!list.length) {
+    const empty = document.createElement("div");
+    empty.className = "skill-empty";
+    empty.innerHTML =
+      "还没有装技能。<br/>去「技能市场」挑几个，或自己写一个 —— 技能就是一份让 AI 照做的说明书。";
+    skillListEl.appendChild(empty);
+    skillRunBtn.disabled = true;
+    return;
+  }
+  skillRunBtn.disabled = false;
+  if (!pickedSkillId || !list.some((s) => s.id === pickedSkillId)) pickedSkillId = list[0].id;
+  for (const s of list) {
+    const item = document.createElement("button");
+    item.className = "skill-item" + (s.id === pickedSkillId ? " active" : "");
+    item.type = "button";
+    const icon = document.createElement("span");
+    icon.className = "skill-item-icon";
+    icon.textContent = s.icon || "🧩";
+    const text = document.createElement("span");
+    text.className = "skill-item-text";
+    const title = document.createElement("b");
+    title.textContent = s.title || s.id;
+    const desc = document.createElement("small");
+    desc.textContent = s.description || "（没有说明）";
+    text.appendChild(title);
+    text.appendChild(desc);
+    const ver = document.createElement("span");
+    ver.className = "skill-item-ver";
+    ver.textContent = "v" + (s.version || "?");
+    item.appendChild(icon);
+    item.appendChild(text);
+    item.appendChild(ver);
+    item.addEventListener("click", () => {
+      pickedSkillId = s.id;
+      renderSkillPicker();
+    });
+    skillListEl.appendChild(item);
+  }
+}
+
+async function runSelectedSkill() {
+  await refreshSkillsCache();
+  const skill = skillsCache[pickedSkillId];
+  if (!skill) {
+    setStatus("没有选中的技能", "err");
+    return;
+  }
+  const rt = activeRuntime();
+  if (!rt) {
+    // 当前页还没建工作区：先建（跟发第一条消息一样的懒创建）
+    const cur = pendingTabId != null ? { id: pendingTabId } : await activeTab();
+    if (!cur || cur.id == null) {
+      setStatus("找不到当前标签页", "err");
+      return;
+    }
+    const newRt = createWorkspaceForTab(cur.id, cur);
+    skillPickerEl.classList.add("hidden");
+    const prompt = buildSkillPrompt(skill, skillExtraEl.value);
+    skillExtraEl.value = "";
+    await newRt.send({ text: prompt, displayText: `🧩 使用技能：${skill.title || skill.id}` });
+    return;
+  }
+  if (rt.busy) {
+    setStatus("正在跑着，等这一轮结束再用技能", "err");
+    return;
+  }
+  const prompt = buildSkillPrompt(skill, skillExtraEl.value);
+  const extra = skillExtraEl.value.trim();
+  skillExtraEl.value = "";
+  skillPickerEl.classList.add("hidden");
+  // displayText：气泡里只显示"用了哪个技能"，不把整份说明书糊在界面上
+  await rt.send({
+    text: prompt,
+    displayText: `🧩 使用技能：${skill.title || skill.id}${extra ? "（" + extra + "）" : ""}`,
+  });
+}
+
+function openSkillMarket() {
+  // 技能市场就在设置页里（那一页地方大，好浏览好编辑），直接跳到技能标签
+  const url = chrome.runtime.getURL("options/index.html") + "#skills";
+  try {
+    chrome.tabs.create({ url });
+  } catch (_) {
+    try {
+      chrome.runtime.openOptionsPage();
+    } catch (__) {}
+  }
+  skillPickerEl.classList.add("hidden");
+}
+
+// ===== 更新提醒 =====
+
+const UPDATE_CHECK_GAP = 6 * 60 * 60 * 1000; // 联网检查最多 6 小时一次
+const REPO_URL = "https://github.com/wangyemen/qingniao";
+
+function renderChangelog(entries) {
+  if (!entries || !entries.length) return "";
+  const parts = [];
+  for (const e of entries) {
+    parts.push(`### ${e.version}`);
+    for (const line of e.lines || []) parts.push(line);
+  }
+  return parts.join("\n");
+}
+
+function showUpdateModal({ title, sub, changelogMd, repoUrl }) {
+  updateTitle.textContent = title || "青鸟已更新";
+  updateSub.textContent = sub || "";
+  const md = changelogMd || "";
+  updateBody.innerHTML = md
+    ? renderMarkdown(md)
+    : '<p class="muted">（这一版没有单独的更新说明）</p>';
+  updateRepoLink.href = repoUrl || REPO_URL;
+  updateModal.classList.remove("hidden");
+}
+
+async function checkUpdates() {
+  let state = {};
+  try {
+    const got = await chrome.storage.local.get(UPDATE_STATE_KEY);
+    state = got[UPDATE_STATE_KEY] || {};
+  } catch (_) {}
+
+  const local = await loadLocalVersionTxt();
+  const seen = state.seenVersion;
+
+  // ① 本机刚更新过（上次看到的是更旧的版本）→ 弹更新日志
+  if (local && seen && seen !== APP_VERSION) {
+    const entries = changelogBetween(local, seen, APP_VERSION);
+    showUpdateModal({
+      title: `青鸟已更新到 v${APP_VERSION}`,
+      sub: `上次是 v${seen}${local.released ? " · " + local.released : ""}`,
+      changelogMd: renderChangelog(entries),
+      repoUrl: local.repo || REPO_URL,
+    });
+    try {
+      await chrome.action.setBadgeText({ text: "新" });
+      await chrome.action.setBadgeBackgroundColor({ color: "#14b8a6" });
+    } catch (_) {}
+    return; // 等用户看完再管"线上有没有更新"
+  }
+
+  // ② 首次安装：记下来，不打扰
+  if (!seen) {
+    try {
+      await chrome.storage.local.set({
+        [UPDATE_STATE_KEY]: { ...state, seenVersion: APP_VERSION, installedAt: Date.now() },
+      });
+    } catch (_) {}
+  }
+
+  // ③ 联网看仓库里有没有更新的版本（有节流；失败静默）
+  const lastCheck = state.checkedAt || 0;
+  if (Date.now() - lastCheck < UPDATE_CHECK_GAP) return;
+  try {
+    await chrome.storage.local.set({ [UPDATE_STATE_KEY]: { ...state, checkedAt: Date.now() } });
+  } catch (_) {}
+  const remote = await loadRemoteVersionTxt();
+  if (!remote) return;
+  const newer = newerThan(remote, APP_VERSION);
+  if (!newer) return;
+  const entries = changelogBetween(remote, APP_VERSION, newer);
+  showUpdateModal({
+    title: `有新版本 v${newer} 可用`,
+    sub: `你当前是 v${APP_VERSION} · 去仓库更新即可（解压覆盖后重新加载扩展）`,
+    changelogMd: renderChangelog(entries),
+    repoUrl: remote.repo || REPO_URL,
+  });
+  try {
+    await chrome.action.setBadgeText({ text: "新" });
+    await chrome.action.setBadgeBackgroundColor({ color: "#f59e0b" });
+  } catch (_) {}
+}
+
+function closeUpdateModal() {
+  updateModal.classList.add("hidden");
+  try {
+    chrome.storage.local.get(UPDATE_STATE_KEY).then((got) => {
+      const state = got[UPDATE_STATE_KEY] || {};
+      return chrome.storage.local.set({
+        [UPDATE_STATE_KEY]: { ...state, seenVersion: APP_VERSION },
+      });
+    });
+    chrome.action.setBadgeText({ text: "" });
+  } catch (_) {}
+  // 关闭后再看看线上有没有新版本
+  setTimeout(() => checkUpdates().catch(() => {}), 600);
 }
