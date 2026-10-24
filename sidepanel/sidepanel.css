@@ -30,6 +30,15 @@
   box-sizing: border-box;
 }
 
+/* 通用隐藏工具类：必须放前面且带 !important。
+   ⚠️ 踩过的坑：本文件以前**没有**通用 .hidden（都是 .merge-bar.hidden 这种逐个写的），
+   于是新加的弹窗（.update-modal-back 自带 display:flex）加上 hidden 类**根本不生效** ——
+   表现就是"点知道了/叉号都关不掉"。加通用规则时务必带 !important，
+   否则会被后面同等权重的 display:xxx 覆盖。 */
+.hidden {
+  display: none !important;
+}
+
 *::-webkit-scrollbar {
   width: 6px;
   height: 6px;

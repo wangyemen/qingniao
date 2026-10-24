@@ -949,11 +949,14 @@ await pageB.reload({ waitUntil: "load" });
 await sleep(2600);
 const updateModalRes = await pageB.evaluate(() => {
   const modal = document.getElementById("updateModal");
-  const visible = !!modal && !modal.classList.contains("hidden");
   const body = document.getElementById("updateBody");
   const title = document.getElementById("updateTitle");
+  // ⚠️ 必须看真实渲染结果，不能只看 class：
+  //    之前 .hidden 被同权重的 display:flex 覆盖，"类加上了但还显示着"就是没测出来。
+  const cs = modal ? getComputedStyle(modal) : null;
   return {
-    visible,
+    visible: !!modal && !modal.classList.contains("hidden") && cs.display !== "none",
+    display: cs ? cs.display : "",
     title: title ? title.textContent : "",
     hasEntry: !!(body && /0\.7\.0|0\.6\.0/.test(body.innerText || "")),
     bodyLen: body ? (body.innerText || "").length : 0,
@@ -961,7 +964,7 @@ const updateModalRes = await pageB.evaluate(() => {
 });
 check("扩展更新后侧栏自动弹出更新日志", updateModalRes.visible && updateModalRes.hasEntry, JSON.stringify(updateModalRes));
 
-// 关掉弹窗 → 记住"已看到这一版"，并且不再显示
+// 关掉弹窗 → 必须**真的从画面上消失**，并且记住"已看到这一版"
 await pageB.evaluate(() => {
   document.getElementById("updateSeenBtn").click();
 });
@@ -970,11 +973,45 @@ const afterSeen = await pageB.evaluate(async () => {
   const modal = document.getElementById("updateModal");
   const got = await chrome.storage.local.get("ai_update_state");
   return {
-    hidden: !!modal && modal.classList.contains("hidden"),
+    display: modal ? getComputedStyle(modal).display : "?",
+    hiddenClass: !!modal && modal.classList.contains("hidden"),
     seen: (got.ai_update_state || {}).seenVersion,
   };
 });
-check("关掉后记住版本、不再重复弹", afterSeen.hidden, JSON.stringify(afterSeen));
+check(
+  "点「知道了」后弹窗真的关掉了（不只看 class）",
+  afterSeen.display === "none" && afterSeen.hiddenClass,
+  JSON.stringify(afterSeen)
+);
+
+// 叉号也要能关：先重新弹出来，再点叉
+await pageB.evaluate(async () => {
+  const KEY = "ai_update_state";
+  const got = await chrome.storage.local.get(KEY);
+  await chrome.storage.local.set({ [KEY]: { ...(got[KEY] || {}), seenVersion: "0.1.0", checkedAt: 0 } });
+});
+await pageB.reload({ waitUntil: "load" });
+await sleep(2600);
+const beforeX = await pageB.evaluate(() => getComputedStyle(document.getElementById("updateModal")).display);
+await pageB.evaluate(() => document.getElementById("updateCloseBtn").click());
+await sleep(700);
+const afterX = await pageB.evaluate(() => getComputedStyle(document.getElementById("updateModal")).display);
+check("点叉号也能关掉弹窗", beforeX !== "none" && afterX === "none", JSON.stringify({ beforeX, afterX }));
+
+// 另外两个用 hidden 的元素（技能面板 / 斜杠菜单）也不该常驻显示
+const floaters = await pageB.evaluate(() => {
+  const picker = document.getElementById("skillPicker");
+  const slash = document.getElementById("slashMenu");
+  return {
+    picker: picker ? getComputedStyle(picker).display : "?",
+    slash: slash ? getComputedStyle(slash).display : "?",
+  };
+});
+check(
+  "技能面板与 / 菜单默认都是隐藏的",
+  floaters.picker === "none" && floaters.slash === "none",
+  JSON.stringify(floaters)
+);
 
 // ---------- ⑤ 关标签页 → 工作区消失 + 会话删除 ----------
 // 注意：先按"工作区 id"过滤，跟历史里堆积的会话无关
