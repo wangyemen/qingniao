@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>测试页 6 · 多策略点击</title>
+</head>
+<body>
+  <h1>多策略点击测试页</h1>
+
+  <!-- ① 只认键盘 Enter 的控件：合成鼠标/指针事件全无反应 -->
+  <div id="kbdWrap" role="button" tabindex="0" style="padding:10px;border:1px solid #888;display:inline-block;">只认键盘的控件</div>
+  <div id="kbdFlag">init</div>
+
+  <!-- ② 事件绑在祖先容器上，内层只是图标 -->
+  <div id="outerBtn" style="padding:10px;border:1px solid #888;display:inline-block;">
+    <span id="iconSpan">★</span> 祖先绑事件的按钮
+  </div>
+  <div id="outerFlag">init</div>
+
+  <!-- ③ 被透明遮挡层盖住的按钮：点它必须命中遮挡层上的 handler -->
+  <div style="position:relative;width:220px;height:60px;">
+    <button id="underBtn" type="button">被遮挡的按钮</button>
+    <div id="overlay" style="position:absolute;inset:0;background:rgba(0,0,0,0.03);"></div>
+  </div>
+  <div id="overlayFlag">init</div>
+
+  <!-- ④ 正常按钮（回归：常规方式一次点中，不重复触发） -->
+  <button id="normalBtn" type="button">普通按钮</button>
+  <div id="normalFlag">init</div>
+
+  <script>
+    document.getElementById("kbdWrap").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("kbdFlag").textContent = "kbd-enter";
+    });
+    // 祖先绑定 click
+    document.getElementById("outerBtn").addEventListener("click", () => {
+      document.getElementById("outerFlag").textContent = "outer-click";
+    });
+    // 遮挡层吃掉点击（真实场景：透明 modal 蒙层）
+    document.getElementById("overlay").addEventListener("click", () => {
+      document.getElementById("overlayFlag").textContent = "overlay-click";
+    });
+    document.getElementById("underBtn").addEventListener("click", () => {
+      document.getElementById("overlayFlag").textContent = "under-click";
+    });
+    // 普通按钮：记录触发次数（验证不重复触发）
+    window.__normalClicks = 0;
+    document.getElementById("normalBtn").addEventListener("click", () => {
+      window.__normalClicks++;
+      document.getElementById("normalFlag").textContent = "clicked-" + window.__normalClicks;
+    });
+  </script>
+</body>
+</html>

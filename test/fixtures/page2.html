@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>测试页 2</title>
+</head>
+<body>
+  <h1 id="title">测试页 2 · 导航成功</h1>
+  <button id="btn2" type="button">第二页按钮</button>
+  <div id="flag2">init</div>
+  <script>
+    document.getElementById("btn2").addEventListener("click", () => {
+      document.getElementById("flag2").textContent = "clicked2";
+    });
+  </script>
+</body>
+</html>

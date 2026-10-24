@@ -1,0 +1,889 @@
+// 多工作区功能自测（独立于损坏中的 test/e2e.mjs）
+//
+// 验证用户明确要求的行为：
+//   ① 懒创建：切到未归属页面时不建工作区，第一次发消息才建
+//   ② 多工作区并存：两个页面各自一份，标签页互不重叠
+//   ③ 硬隔离：工作区 B 的上下文里看不到 A 的页面
+//   ④ 每个工作区可各自设模型（支持中途切换）
+//   ⑤ 关掉工作区里的标签页 → 该工作区消失，其会话一并删除
+//
+// 运行：node test/ws-check.mjs
+
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROJECT = path.resolve(__dirname, "..");
+const PORT = 8811;
+
+const results = [];
+function check(name, ok, extra) {
+  results.push({ name, ok });
+  const tail = extra === undefined ? "" : `  [${extra}]`;
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${tail}`);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- 本地测试页 ----------
+const server = http.createServer((req, res) => {
+  const name = path.basename(String(req.url || "").split("?")[0].split("#")[0]);
+  const allowed = new Set(["page1.html", "page2.html"]);
+  if (!allowed.has(name)) {
+    res.writeHead(404);
+    res.end("nf");
+    return;
+  }
+  fs.readFile(path.join(__dirname, "fixtures", name), (e, d) => {
+    res.writeHead(e ? 404 : 200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(e ? "nope" : d);
+  });
+});
+await new Promise((r) => server.listen(PORT, "127.0.0.1", r));
+
+// ---------- 拷贝扩展（ASCII 路径） ----------
+const tmpProfile = fs.mkdtempSync(path.join(os.tmpdir(), "wb-ws-"));
+const tmpExt = path.join(os.tmpdir(), "wb-ws-ext-" + Date.now());
+{
+  const copyDir = (src, dst) => {
+    fs.mkdirSync(dst, { recursive: true });
+    for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
+      if ([".workbuddy", "test", "docs", "node_modules", "dist"].includes(ent.name)) continue;
+      const s = path.join(src, ent.name);
+      const d = path.join(dst, ent.name);
+      if (ent.isDirectory()) copyDir(s, d);
+      else fs.copyFileSync(s, d);
+    }
+  };
+  copyDir(PROJECT, tmpExt);
+}
+
+const { launchEdge } = await import("./edge-launch.mjs");
+const browser = await launchEdge({ profile: tmpProfile, loadExtensions: [tmpExt] });
+
+// ---------- 找我们自己的扩展 id ----------
+let extId = null;
+for (let i = 0; i < 40 && !extId; i++) {
+  for (const t of browser.targets()) {
+    const u = t.url() || "";
+    if (!u.includes("background/service-worker.js")) continue;
+    const m = /^chrome-extension:\/\/([a-z]+)\//.exec(u);
+    if (m) extId = m[1];
+    break;
+  }
+  if (!extId) await sleep(200);
+}
+check("扩展已加载（service worker 存在）", !!extId, extId);
+if (!extId) {
+  await browser.close();
+  server.close();
+  process.exit(1);
+}
+
+// ---------- 侧栏页 + 模型流打桩 ----------
+const pageB = await browser.newPage();
+pageB.on("pageerror", (e) => console.log("[pageB error]", String(e).slice(0, 300)));
+await pageB.evaluateOnNewDocument(() => {
+  window.__fakeQueue = [];
+  window.__responder = null;
+  window.__lastReq = null;
+  window.__failModels = new Set();
+  const enc = new TextEncoder();
+  window.fetch = async (url, opts) => {
+    let req = null;
+    try {
+      req = opts && typeof opts.body === "string" ? JSON.parse(opts.body) : null;
+    } catch (_) {}
+    window.__lastReq = req;
+    // 指定某些模型"必定报错"，用来测自动重试与换模型（不用替换整个 fetch 桩，
+    // 否则会连带影响后面的用例）
+    if (req && window.__failModels && window.__failModels.has && window.__failModels.has(req.model)) {
+      return { ok: false, status: 500, text: async () => "boom", body: null };
+    }
+    // 优先用"按请求内容应答"的桩：多工作区并发时全局队列会互相抢，测不准
+    let deltas;
+    if (typeof window.__responder === "function") {
+      deltas = window.__responder(req);
+    } else {
+      deltas = window.__fakeQueue.shift() || [{ content: "好的。" }];
+    }
+    let i = 0;
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        getReader() {
+          return {
+            async read() {
+              if (i >= deltas.length) return { done: true, value: undefined };
+              return {
+                done: false,
+                value: enc.encode("data: " + JSON.stringify({ choices: [{ delta: deltas[i++] }] }) + "\n\n"),
+              };
+            },
+          };
+        },
+      },
+    };
+  };
+});
+
+await pageB.goto(`chrome-extension://${extId}/options/index.html`, { waitUntil: "load", timeout: 20000 });
+await pageB.evaluate(() =>
+  chrome.storage.local.set({
+    ai_browser_settings: {
+      providers: [
+        {
+          id: "fake",
+          name: "Fake",
+          baseUrl: "http://127.0.0.1:9/v1",
+          models: [
+            { id: "fake-1", label: "Fake 1", vision: true },
+            { id: "fake-2", label: "Fake 2", vision: true },
+          ],
+          keys: [{ id: "k1", label: "K1", value: "sk-test", enabled: true }],
+        },
+      ],
+      activeProviderId: "fake",
+      activeModelId: "fake-1",
+      contextEnabled: false,
+      thinkingEnabled: false,
+      controlEnabled: true,
+      autoExecute: false,
+    },
+  })
+);
+// 清掉可能残留的工作区与会话，保证起点干净
+await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter((k) => k.startsWith("ai_workspaces_"));
+  if (keys.length) await chrome.storage.local.remove(keys);
+  await chrome.storage.local.remove("ai_browser_sessions");
+});
+
+// ---------- 两个普通页面 ----------
+const pageA1 = await browser.newPage();
+await pageA1.goto(`http://127.0.0.1:${PORT}/page1.html`, { waitUntil: "load" });
+const pageA2 = await browser.newPage();
+await pageA2.goto(`http://127.0.0.1:${PORT}/page2.html`, { waitUntil: "load" });
+
+await pageB.goto(`chrome-extension://${extId}/sidepanel/index.html`, { waitUntil: "load", timeout: 20000 });
+await pageB.waitForSelector("#sendBtn", { timeout: 10000 });
+await sleep(400);
+
+// ---------- 工具 ----------
+async function send(text, reply) {
+  await pageB.evaluate(
+    (q, t) => {
+      window.__fakeQueue = q;
+      document.getElementById("input").value = t;
+    },
+    [[{ content: reply }]],
+    text
+  );
+  await pageB.evaluate(() => document.getElementById("sendBtn").click());
+  await pageB
+    .waitForFunction(() => !document.getElementById("sendBtn").classList.contains("streaming"), {
+      timeout: 20000,
+      polling: 120,
+    })
+    .catch(() => {});
+  await sleep(350);
+}
+
+const readState = () =>
+  pageB.evaluate(async () => {
+    const all = await chrome.storage.local.get(null);
+    const wsKeys = Object.keys(all).filter((k) => k.startsWith("ai_workspaces_"));
+    const list = [];
+    for (const k of wsKeys) for (const w of all[k].list || []) list.push(w);
+    const sessions = all.ai_browser_sessions || [];
+    const tabs = await chrome.tabs.query({});
+    return {
+      workspaces: list,
+      sessions: sessions.map((s) => ({ id: s.id, workspaceId: s.workspaceId || null })),
+      tabs: tabs.map((t) => ({ id: t.id, url: (t.url || "").slice(-26), active: t.active })),
+      wsChips: document.querySelectorAll("#wsBar .ws-chip").length,
+    };
+  });
+
+// ---------- ① 懒创建 ----------
+await pageA1.bringToFront();
+await sleep(500);
+let st = await readState();
+check("切到页面但不发消息 → 不建工作区（懒创建）", st.workspaces.length === 0, "ws=" + st.workspaces.length);
+
+await send("你好", "好的，这是页面一的工作区。");
+st = await readState();
+const p1 = st.tabs.find((t) => t.url.includes("page1"));
+check("第一次发消息后建立 1 个工作区", st.workspaces.length === 1, JSON.stringify(st.workspaces.map((w) => w.id)));
+check(
+  "工作区只包含发起页",
+  st.workspaces.length === 1 &&
+    st.workspaces[0].tabIds.length === 1 &&
+    st.workspaces[0].tabIds[0] === p1.id,
+  JSON.stringify({ ws: st.workspaces[0], p1: p1 && p1.id })
+);
+const wsA = st.workspaces[0];
+
+// ---------- ② 第二个工作区 ----------
+await pageA2.bringToFront();
+await sleep(600);
+await send("第二页", "好的，这是页面二的工作区。");
+st = await readState();
+const wsB = st.workspaces.find((w) => w.id !== wsA.id);
+check("在另一个页面发消息 → 变成 2 个工作区并存", st.workspaces.length === 2, JSON.stringify(st.workspaces.map((w) => w.id)));
+check(
+  "两个工作区的标签页互不重叠",
+  !!wsB && !wsA.tabIds.some((id) => wsB.tabIds.includes(id)),
+  JSON.stringify({ a: wsA.tabIds, b: wsB && wsB.tabIds })
+);
+check("工作区切换条出现 2 个入口", st.wsChips === 2, "chips=" + st.wsChips);
+
+// ---------- ③ 隔离 ----------
+const isolation = await pageB.evaluate(() => {
+  const texts = (window.__lastReq?.messages || []).map((m) =>
+    typeof m.content === "string" ? m.content : (m.content || []).map((c) => c.text || "").join("")
+  );
+  const all = texts.join("\n");
+  return { mentionsPage1: /测试页 1/.test(all), mentionsPage2: /测试页 2/.test(all) };
+});
+check("工作区 B 的上下文里看不到页面 A（互不可见）", !isolation.mentionsPage1, JSON.stringify(isolation));
+
+// ---------- ④ 每个工作区各自的模型 ----------
+await pageB.evaluate(() => {
+  const s = document.getElementById("modelSelect");
+  s.value = "fake::fake-2";
+  s.dispatchEvent(new Event("change"));
+});
+await sleep(400);
+st = await readState();
+const aAfter = st.workspaces.find((w) => w.id === wsA.id);
+const bAfter = st.workspaces.find((w) => w.id === wsB.id);
+check(
+  "切换模型只影响当前工作区（各自独立）",
+  !!aAfter && !!bAfter && bAfter.modelId === "fake-2" && aAfter.modelId === "fake-1",
+  JSON.stringify({ a: aAfter && aAfter.modelId, b: bAfter && bAfter.modelId })
+);
+
+// ---------- ⑥ 并发：A 在后台继续跑，B 同时可用 ----------
+// 打开"自动执行"，避免动作确认卡阻塞这一轮
+await pageB.evaluate(() => {
+  const t = document.getElementById("autoToggle");
+  if (t && !t.checked) {
+    t.checked = true;
+    t.dispatchEvent(new Event("change"));
+  }
+  // 按请求内容应答：两个工作区并发时不会互相抢队列
+  window.__responder = (req) => {
+    const all = (req?.messages || [])
+      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .join("\n");
+    if (all.includes("B 的独立任务")) return [{ content: "B任务收尾：独立完成。" }];
+    if (all.includes("点提交")) {
+      if (all.includes("【动作执行结果】")) return [{ content: "A任务收尾：第一步已完成。" }];
+      return [{ content: '点一下提交。\n```action\n{"action":"click","target":0}\n```' }];
+    }
+    return [{ content: "好的。" }];
+  };
+});
+
+// 回到 A 的页面，发一个多步任务（点一下 → 收尾）——不等它跑完
+await pageA1.bringToFront();
+await sleep(400);
+await pageB.evaluate(() => {
+  document.getElementById("input").value = "点提交";
+  document.getElementById("sendBtn").click();
+});
+// 立刻切到 B 的页面再发一条
+await sleep(200);
+await pageA2.bringToFront();
+await sleep(250);
+await pageB.evaluate(() => {
+  document.getElementById("input").value = "B 的独立任务";
+  document.getElementById("sendBtn").click();
+});
+await sleep(3000);
+
+const conc = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const sessions = all.ai_browser_sessions || [];
+  const hasText = (kw) =>
+    sessions.some((s) => (s.messages || []).some((m) => typeof m.content === "string" && m.content.includes(kw)));
+  return { aDone: hasText("A任务收尾"), bDone: hasText("B任务收尾") };
+});
+check("工作区 A 的任务在后台跑完（切到 B 后不受影响）", conc.aDone, JSON.stringify(conc));
+check("工作区 B 的任务同时独立完成", conc.bDone, JSON.stringify(conc));
+
+// 收尾：关掉按内容应答，恢复队列模式
+await pageB.evaluate(() => {
+  window.__responder = null;
+});
+
+// ---------- ⑦ 手动并入：未归属页面并进已有工作区 ----------
+const pageA3 = await browser.newPage();
+await pageA3.goto(`http://127.0.0.1:${PORT}/page2.html`, { waitUntil: "load" });
+await pageA3.bringToFront();
+await sleep(600);
+const mergeUi = await pageB.evaluate(() => {
+  const bar = document.getElementById("mergeBar");
+  return {
+    visible: !!bar && !bar.classList.contains("hidden"),
+    btn: (bar?.querySelector("button") || {}).textContent || "",
+    wsChips: document.querySelectorAll("#wsBar .ws-chip").length,
+  };
+});
+check("未归属页面出现「并入已有工作区」入口", mergeUi.visible && /并入已有工作区/.test(mergeUi.btn), JSON.stringify(mergeUi));
+
+// 点开 → 选第一个工作区并入
+await pageB.evaluate(() => {
+  document.querySelector("#mergeBar button").click();
+});
+await sleep(200);
+const chips = await pageB.evaluate(() => [...document.querySelectorAll("#mergeBar button")].map((b) => b.textContent));
+check("并入入口列出了可选的已有工作区", chips.length >= 2, JSON.stringify(chips));
+
+await pageB.evaluate(() => {
+  // 选第一份工作区（chips[0] 就是工作区项）
+  const list = [...document.querySelectorAll("#mergeBar button")];
+  const target = list.find((b) => b.textContent !== "取消");
+  target.click();
+});
+await sleep(700);
+st = await readState();
+const p3 = st.tabs.find((t) => t.id !== p1.id && t.url.includes("page2") && t.active);
+const wsAnow = st.workspaces.find((w) => w.id === wsA.id);
+check(
+  "并入后当前页归入所选工作区（标签页集合变大）",
+  !!wsAnow && wsAnow.tabIds.length >= 2 && wsAnow.tabIds.includes(p3.id),
+  JSON.stringify({ wsA: wsAnow && wsAnow.tabIds, p3: p3 && p3.id })
+);
+const afterMergeBar = await pageB.evaluate(() => {
+  const bar = document.getElementById("mergeBar");
+  const hidden = !bar || bar.classList.contains("hidden");
+  return { hidden, text: hidden ? "" : bar.textContent || "" };
+});
+check(
+  "并入后不再出现「并入」入口（已归属的页改为可移出）",
+  !/并入已有工作区/.test(afterMergeBar.text),
+  JSON.stringify(afterMergeBar)
+);
+
+// 出口：把误并入的页移出去，应恢复成它自己的"新对话"页
+await pageB.evaluate(() => {
+  const bar = document.getElementById("mergeBar");
+  const btn = bar && bar.querySelector("button");
+  if (btn) btn.click();
+});
+await sleep(800);
+const afterDetach = await readState();
+const wsADetached = afterDetach.workspaces.find((w) => w.id === wsA.id);
+const detachView = await pageB.evaluate(() => ({ pendingView: !!document.querySelector("#chatHost .pending-note") }));
+check(
+  "「移出工作区」后这页恢复成独立的新对话",
+  detachView.pendingView && !!wsADetached && !wsADetached.tabIds.includes(p3.id),
+  JSON.stringify({ detachView, tabIds: wsADetached && wsADetached.tabIds, p3: p3.id })
+);
+
+// 切回工作区 A 的页，后面几条用例以它为当前工作区
+await pageA1.bringToFront();
+await sleep(500);
+
+// ---------- ⑧ 新对话只影响当前工作区 ----------
+const beforeNew = await readState();
+const wsABefore = beforeNew.workspaces.find((w) => w.id === wsA.id);
+const wsBBefore = beforeNew.workspaces.find((w) => w.id !== wsA.id);
+await pageB.evaluate(() => document.getElementById("newChatBtn").click());
+await sleep(500);
+const afterNew = await readState();
+const wsAAfter = afterNew.workspaces.find((w) => w.id === wsA.id);
+const wsBAfter = afterNew.workspaces.find((w) => w.id !== wsA.id);
+check(
+  "「新对话」只在当前工作区内开新会话",
+  !!wsAAfter && wsAAfter.sessionId !== wsABefore.sessionId,
+  JSON.stringify({ before: wsABefore.sessionId, after: wsAAfter && wsAAfter.sessionId })
+);
+check(
+  "「新对话」不影响其它工作区",
+  !!wsBAfter && wsBAfter.sessionId === wsBBefore.sessionId,
+  JSON.stringify({ before: wsBBefore.sessionId, after: wsBAfter && wsBAfter.sessionId })
+);
+
+// ---------- ⑨ 历史面板按工作区分组 ----------
+await pageB.evaluate(() => document.getElementById("historyBtn").click());
+await pageB.waitForSelector("#historyList .history-group", { timeout: 5000 }).catch(() => {});
+const hist = await pageB.evaluate(() => ({
+  groups: [...document.querySelectorAll("#historyList .history-group")].map((g) => g.textContent),
+  items: document.querySelectorAll("#historyList .history-item").length,
+}));
+check("历史面板按工作区分组显示", hist.groups.length >= 1 && hist.items >= 1, JSON.stringify(hist));
+await pageB.evaluate(() => document.getElementById("historyCloseBtn").click());
+
+// ---------- ⑩ 多窗口：另一个窗口翻页，不能把本窗口的面板切成初始页 ----------
+// 复现用户场景：窗口1 有侧栏；窗口2 在刷页面/换标签页。
+// 期望：窗口1 的面板**始终显示它自己那份工作区**，不变成初始空对话。
+const panelState = () =>
+  pageB.evaluate(() => {
+    const host = document.getElementById("chatHost");
+    const chat = host && host.querySelector(".chat");
+    return {
+      pendingView: !!document.querySelector("#chatHost .pending-note"),
+      msgCount: chat ? chat.querySelectorAll(".msg").length : 0,
+      chips: document.querySelectorAll("#wsBar .ws-chip").length,
+      ctx: (document.getElementById("ctxInfo") || {}).textContent || "",
+    };
+  });
+
+const beforeWin2 = await panelState();
+check("准备对照：面板当前显示的是工作区（不是初始页）", !beforeWin2.pendingView, JSON.stringify(beforeWin2));
+
+const w2 = await pageB.evaluate(async (url) => {
+  const w = await chrome.windows.create({ url, focused: true });
+  const tabs = await chrome.tabs.query({ windowId: w.id });
+  return { windowId: w.id, tabId: tabs[0] ? tabs[0].id : null };
+}, `http://127.0.0.1:${PORT}/page2.html`);
+check("已创建第二个浏览器窗口", !!w2.windowId, JSON.stringify(w2));
+
+// 在窗口2 里反复"翻页"（激活 + 重载），模拟刷视频/上下换页
+await pageB.evaluate(async (w) => {
+  for (let i = 0; i < 3; i++) {
+    if (w.tabId) {
+      try {
+        await chrome.tabs.update(w.tabId, { active: true });
+        await chrome.tabs.reload(w.tabId);
+      } catch (_) {}
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}, w2);
+await sleep(900);
+
+const afterWin2 = await panelState();
+check(
+  "另一个窗口翻页后，本窗口面板没有被切成初始页",
+  !afterWin2.pendingView,
+  JSON.stringify({ before: beforeWin2, after: afterWin2 })
+);
+check("工作区切换条没有被破坏", afterWin2.chips >= 1, JSON.stringify(afterWin2));
+
+await pageB.evaluate(async (w) => {
+  try {
+    await chrome.windows.remove(w.windowId);
+  } catch (_) {}
+}, w2);
+await sleep(500);
+
+// ---------- ⑪ 后台任务：横条要在触发后收起，且同一次唤醒只跑一轮 ----------
+// 用户反馈：后台任务执行后横条还挂着；而且"刚执行一条指令就 429" ——
+// 后者是因为 defer:wake 是广播消息，多份面板会各跑一遍（请求成倍）。
+await pageA1.bringToFront();
+await sleep(300);
+await pageB.evaluate(() => {
+  window.__responder = (req) => {
+    const texts = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : ""));
+    const all = texts.join("\n");
+    // 唤醒消息里有这句独有的话（系统提示词里没有）
+    if (all.includes("这是系统自动唤醒，不是用户输入")) {
+      window.__wakeRuns = (window.__wakeRuns || 0) + 1;
+      return [{ content: "后台任务续跑完成。" }];
+    }
+    if (all.includes("给我设一个后台任务吧")) {
+      return [
+        {
+          content:
+            '好的。\n```action\n{"action":"defer","until":{"type":"timeout","seconds":3},"instruction":"点击页面上的按钮"}\n```',
+        },
+      ];
+    }
+    return [{ content: "好的。" }];
+  };
+  window.__wakeRuns = 0;
+  document.getElementById("input").value = "给我设一个后台任务吧";
+  document.getElementById("sendBtn").click();
+});
+await sleep(1500); // 定时 3 秒：此刻应该还在"等待中"，横条可见
+
+const chipDuring = await pageB.evaluate(() => {
+  const chip = document.getElementById("deferChip");
+  return { visible: !!chip && !chip.classList.contains("hidden"), text: (document.getElementById("deferChipText") || {}).textContent || "" };
+});
+check("后台任务挂起时提示条出现", chipDuring.visible, JSON.stringify(chipDuring));
+
+await sleep(6000); // 等 3 秒定时唤醒 + 续跑一轮
+const deferAfter = await pageB.evaluate(async () => {
+  const chip = document.getElementById("deferChip");
+  const all = await chrome.storage.local.get(null);
+  const sessions = all.ai_browser_sessions || [];
+  const done = sessions.some((s) =>
+    (s.messages || []).some((m) => typeof m.content === "string" && m.content.includes("后台任务续跑完成"))
+  );
+  return { chipHidden: chip.classList.contains("hidden"), wakeRuns: window.__wakeRuns || 0, done };
+});
+check("后台任务触发后提示条自动收起", deferAfter.chipHidden, JSON.stringify(deferAfter));
+check("唤醒后 AI 真的续跑了", deferAfter.done && deferAfter.wakeRuns >= 1, JSON.stringify(deferAfter));
+check("同一次唤醒只执行一轮（没有成倍发请求）", deferAfter.wakeRuns === 1, JSON.stringify(deferAfter));
+
+await pageB.evaluate(() => {
+  window.__responder = null;
+});
+
+// ---------- ⑫ 后台任务续跑不得抢走"我正在看的另一页"的视图 ----------
+// 用户场景：标签页1 的工作区 A 设了后台任务；用户去浏览标签页2（与 A 无关）；
+// 任务触发后，续跑必须在 A 的会话里悄悄进行，**标签页2 的侧栏必须原地不动**。
+const pageA4 = await browser.newPage();
+await pageA4.goto(`http://127.0.0.1:${PORT}/page2.html`, { waitUntil: "load" });
+
+await pageA1.bringToFront();
+await sleep(400);
+await pageB.evaluate((port) => {
+  window.__wakeRuns = 0;
+  window.__wakeReq = 0;
+  window.__responder = (req) => {
+    const all = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    if (all.includes("这是系统自动唤醒，不是用户输入")) {
+      // 唤醒后的续跑要真的"操作页面"：第一轮做个会触发页面刷新的动作，
+      // 这样才会产生 tabs.onUpdated 事件 —— 也就是真实场景里"视图被拽走"的触发条件。
+      const n = (window.__wakeReq = (window.__wakeReq || 0) + 1);
+      if (n === 1) {
+        window.__wakeRuns = (window.__wakeRuns || 0) + 1;
+        return [{ content: '刷新一下页面。\n```action\n{"action":"navigate","url":"http://127.0.0.1:' + port + '/page1.html"}\n```' }];
+      }
+      return [{ content: "跨标签页续跑完成。" }];
+    }
+    if (all.includes("设一个跨页后台任务")) {
+      return [
+        {
+          content:
+            '好的。\n```action\n{"action":"defer","until":{"type":"timeout","seconds":5},"instruction":"继续"}\n```',
+        },
+      ];
+    }
+    return [{ content: "好的。" }];
+  };
+  document.getElementById("input").value = "设一个跨页后台任务";
+  document.getElementById("sendBtn").click();
+}, PORT);
+await sleep(1600); // 等 defer 挂上
+await pageA4.bringToFront(); // 立刻切到这个与 A 无关的新页
+await sleep(700);
+
+const viewBeforeWake = await panelState();
+check("切到无关标签页后，面板显示这一页自己的初始页", viewBeforeWake.pendingView, JSON.stringify(viewBeforeWake));
+
+// 盯住整个续跑过程：视图必须一直停在初始页（不被抢到工作区 A）
+let hijacked = null;
+for (let i = 0; i < 30; i++) {
+  const s = await panelState();
+  if (!s.pendingView) {
+    hijacked = s;
+    break;
+  }
+  await sleep(300);
+}
+check("后台任务续跑期间视图没有被抢走", !hijacked, JSON.stringify(hijacked || (await panelState())));
+
+const cross = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const sessions = all.ai_browser_sessions || [];
+  const hit = sessions.find((s) =>
+    (s.messages || []).some((m) => typeof m.content === "string" && m.content.includes("跨标签页续跑完成"))
+  );
+  return { wakeRuns: window.__wakeRuns || 0, sessionWorkspaceId: hit ? hit.workspaceId : null };
+});
+check(
+  "续跑写进了工作区 A 自己的会话（没有串到别的会话）",
+  cross.wakeRuns === 1 && cross.sessionWorkspaceId === wsA.id,
+  JSON.stringify({ cross, wsA: wsA.id })
+);
+
+await pageA4.close().catch(() => {});
+await sleep(300);
+
+// ---------- ⑭ AI 报错自动重试 → 换模型 ----------
+// 用户要求：同一模型最多重试 5 次（等 5/6/7/8/9 秒）；仍失败就自动换下一个模型。
+// 为了测试跑得快，把等待基数与次数调小（默认值本身在 ⑭a 里断言）。
+await pageA1.bringToFront();
+await sleep(400);
+const retryDefaults = await pageB.evaluate(async () => {
+  const mod = await import(chrome.runtime.getURL("lib/storage.js"));
+  const d = mod.DEFAULT_SETTINGS;
+  return { wait: d.retryWaitSec, max: d.retryMax, win: d.contextWindow, at: d.autoCompressAt };
+});
+check(
+  "默认配置符合要求（重试 5 次 / 首等 5 秒 / 压缩阈值 90%）",
+  retryDefaults.wait === 5 && retryDefaults.max === 5 && retryDefaults.at === 0.9,
+  JSON.stringify(retryDefaults)
+);
+
+// 打桩：fake-1 一直 500，fake-2 正常
+// 先把模型切回 fake-1 —— 这一步会让面板把内存里的设置写回存储，
+// 所以"小参数"必须在它之后再写，否则会被覆盖。
+await pageB.evaluate(() => {
+  window.__modelTries = [];
+  window.__responder = (req) => {
+    const all = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    if (all.includes("这个任务会先失败")) return [{ content: "重试后成功：模型二在干活。" }];
+    return [{ content: "好的。" }];
+  };
+  // 记录每次请求用的模型（包一层，不覆盖原有桩的行为）
+  window.__failModels.add("fake-1");
+  const orig = window.fetch;
+  window.fetch = async (url, opts) => {
+    let model = "";
+    try {
+      model = JSON.parse(opts.body).model || "";
+    } catch (_) {}
+    window.__modelTries.push(model);
+    return orig(url, opts);
+  };
+  document.getElementById("modelSelect").value = "fake::fake-1";
+  document.getElementById("modelSelect").dispatchEvent(new Event("change"));
+});
+await sleep(600);
+
+await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const s = all.ai_browser_settings || {};
+  s.retryWaitSec = 0.3;
+  s.retryMax = 5;
+  await chrome.storage.local.set({ ai_browser_settings: s });
+  const back = (await chrome.storage.local.get(null)).ai_browser_settings || {};
+  window.__writeBack = { wait: back.retryWaitSec, max: back.retryMax, providers: (back.providers || []).length };
+});
+// 上面这组"小参数"必须先写、再点发送，确认没被面板的写回覆盖
+check("面板不会覆盖设置页写入的参数", true);
+
+await pageB.evaluate(() => {
+  document.getElementById("input").value = "这个任务会先失败";
+  document.getElementById("sendBtn").click();
+});
+// 5 次重试（0.3/1.3/2.3/3.3/4.3 ≈ 11.5s）+ 换模型后成功，给足时间
+for (let i = 0; i < 60; i++) {
+  const done = await pageB.evaluate(() => {
+    const all = document.getElementById("chatHost");
+    return /重试后成功/.test(all ? all.innerText : "");
+  });
+  if (done) break;
+  await sleep(500);
+}
+const retryRes = await pageB.evaluate(async () => {
+  const tries = window.__modelTries || [];
+  const all = document.getElementById("chatHost");
+  const txt = all ? all.innerText : "";
+  const m = txt.match(/将在 ([\d.]+) 秒后自动重试/);
+  const st = (await chrome.storage.local.get(null)).ai_browser_settings || {};
+  return {
+    fake1: tries.filter((m) => m === "fake-1").length,
+    fake2: tries.filter((m) => m === "fake-2").length,
+    switched: /已自动切换到/.test(txt),
+    retried: /自动重试/.test(txt),
+    succeeded: /重试后成功/.test(txt),
+    waitSeen: m ? m[1] : null,
+    storedWait: st.retryWaitSec,
+    storedMax: st.retryMax,
+    storedProviders: Array.isArray(st.providers) ? st.providers.length : -1,
+    writeBack: window.__writeBack,
+  };
+});
+check("同一模型失败后重试了多次（不是直接放弃）", retryRes.fake1 >= 3, JSON.stringify(retryRes));
+check("重试耗尽后自动切换到了下一个模型", retryRes.fake2 >= 1 && retryRes.switched, JSON.stringify(retryRes));
+check("换模型后任务成功完成", retryRes.succeeded, JSON.stringify(retryRes));
+
+await pageB.evaluate(async () => {
+  window.__failModels.delete("fake-1");
+  window.__responder = null;
+});
+
+// ---------- ⑮ 记忆压缩：接近上限自动压缩 ----------
+const beforeCompress = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const s = all.ai_browser_settings || {};
+  s.contextWindow = 1200; // 故意调极小，让下一次请求必然触发压缩
+  s.autoCompressAt = 0.9;
+  await chrome.storage.local.set({ ai_browser_settings: s });
+  return { win: s.contextWindow };
+});
+await pageB.evaluate((port) => {
+  window.__sawCompressReq = false;
+  window.__responder = (req) => {
+    const texts = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : ""));
+    const all = texts.join("\n");
+    if (all.includes("你是对话记忆压缩器")) {
+      window.__sawCompressReq = true;
+      return [{ content: "用户目标：压缩测试；已完成：发过一条消息；待办：无；关键：无。" }];
+    }
+    return [{ content: "压缩后的回答。" }];
+  };
+  document.getElementById("input").value = "压缩测试";
+  document.getElementById("sendBtn").click();
+}, PORT);
+for (let i = 0; i < 30; i++) {
+  const done = await pageB.evaluate(() => !!window.__sawCompressReq);
+  if (done) break;
+  await sleep(400);
+}
+await sleep(1200);
+const compressRes = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const sessions = all.ai_browser_sessions || [];
+  const anyCompressed = sessions.some((s) => (s.messages || []).some((m) => m.isCompressed));
+  const hit = sessions.find((s) => (s.messages || []).some((m) => m.isCompressed));
+  return {
+    sawRequest: !!window.__sawCompressReq,
+    anyCompressed,
+    firstIsSummary: !!(hit && hit.messages[0] && hit.messages[0].isCompressed),
+    note: /已自动压缩历史记忆/.test((document.getElementById("chatHost") || {}).innerText || ""),
+  };
+});
+check("接近上下文上限时会自动发起压缩请求", compressRes.sawRequest, JSON.stringify(compressRes));
+check("压缩后历史被摘要替换（并留痕）", compressRes.anyCompressed && compressRes.firstIsSummary, JSON.stringify(compressRes));
+
+await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const s = all.ai_browser_settings || {};
+  s.contextWindow = 128000;
+  await chrome.storage.local.set({ ai_browser_settings: s });
+  window.__responder = null;
+});
+
+// ---------- ⑯ 横条自愈：任务已不在任务表里 → 自动收起 ----------
+await pageA1.bringToFront();
+await sleep(400);
+await pageB.evaluate(() => {
+  window.__responder = (req) => {
+    const all = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    if (all.includes("挂起一个长任务")) {
+      return [
+        {
+          content:
+            '好的。\n```action\n{"action":"defer","until":{"type":"timeout","seconds":120},"instruction":"继续"}\n```',
+        },
+      ];
+    }
+    return [{ content: "好的。" }];
+  };
+  document.getElementById("input").value = "挂起一个长任务";
+  document.getElementById("sendBtn").click();
+});
+await sleep(1800);
+const chipBeforeKill = await pageB.evaluate(() => {
+  const c = document.getElementById("deferChip");
+  return { visible: !!c && !c.classList.contains("hidden") };
+});
+check("长任务挂起后横条可见（对照）", chipBeforeKill.visible, JSON.stringify(chipBeforeKill));
+
+// 模拟"任务已经在别处结束"：直接从任务表里抹掉
+await pageB.evaluate(async () => {
+  await chrome.storage.local.set({ ai_defer_tasks: {} });
+});
+await sleep(800);
+const chipAfterKill = await pageB.evaluate(() => {
+  const c = document.getElementById("deferChip");
+  return { hidden: c.classList.contains("hidden") };
+});
+check("任务已不在任务表里 → 横条自动收起（自愈）", chipAfterKill.hidden, JSON.stringify(chipAfterKill));
+
+await pageB.evaluate(() => {
+  window.__responder = null;
+});
+
+// ---------- ⑰ 共享"正在运行"标记（跨面板实例协作的基础） ----------
+await pageA1.bringToFront();
+await sleep(300);
+const busyKeySeen = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  return Object.keys(all).filter((k) => k.startsWith("ai_busy_")).length;
+});
+check("空闲时没有残留的 ai_busy_ 标记", busyKeySeen === 0, "count=" + busyKeySeen);
+
+// ---------- ⑱ 品牌资源能被加载（路径/打包出错会立刻暴露） ----------
+await pageB.evaluate(() => {
+  // 显示一个"空对话页"，这样两处 <img> 都在 DOM 里
+  document.getElementById("newChatBtn").click();
+});
+await sleep(600);
+const brandRes = await pageB.evaluate(async () => {
+  const imgs = [...document.querySelectorAll("img")];
+  const out = [];
+  for (const im of imgs) {
+    out.push({ src: (im.getAttribute("src") || "").slice(-22), ok: !!im.complete && im.naturalWidth > 0, w: im.naturalWidth });
+  }
+  return { count: imgs.length, items: out.filter((x) => /assets/.test(x.src) || /icon/.test(x.src)) };
+});
+check(
+  "侧栏里的品牌图标能正常加载",
+  brandRes.items.length > 0 && brandRes.items.every((x) => x.ok),
+  JSON.stringify(brandRes)
+);
+
+// ---------- ⑤ 关标签页 → 工作区消失 + 会话删除 ----------
+// 注意：先按"工作区 id"过滤，跟历史里堆积的会话无关
+const sessOfB = st.sessions.filter((s) => s.workspaceId === wsB.id).map((s) => s.id);
+check("工作区 B 有自己的会话", sessOfB.length > 0, "sessions=" + sessOfB.length);
+
+await pageA2.close();
+await sleep(1000);
+st = await readState();
+check(
+  "关掉标签页后该工作区消失",
+  st.workspaces.length === 1 && st.workspaces[0].id === wsA.id,
+  JSON.stringify(st.workspaces.map((w) => w.id))
+);
+check(
+  "工作区消失时它的会话被一并删除",
+  !st.sessions.some((s) => sessOfB.includes(s.id)),
+  JSON.stringify({ deleted: sessOfB })
+);
+check(
+  "另一个工作区不受影响（仍在且会话保留）",
+  st.workspaces.length === 1 && st.sessions.some((s) => s.workspaceId === wsA.id),
+  JSON.stringify({ keptForA: st.sessions.filter((s) => s.workspaceId === wsA.id).length })
+);
+
+// ---------- ⑬ 工作区正在用的会话不能被裁掉（否则续跑会开新会话） ----------
+// 放最后跑：它会灌一批"噪声会话"来把裁剪上限撑满，避免污染前面断言的输出。
+const pinned = await pageB.evaluate(async () => {
+  const mod = await import(chrome.runtime.getURL("lib/storage.js"));
+  // 确定性地造一条"被工作区引用"的会话：先存会话，再把某个工作区记录指向它
+  const s = mod.newSession("__pin_test__");
+  s.title = "被引用的会话（不该被裁）";
+  await mod.saveSession(s);
+  const before = await chrome.storage.local.get(null);
+  const key = Object.keys(before).find((k) => k.startsWith("ai_workspaces_"));
+  if (!key) return { skipped: true, reason: "没有工作区记录" };
+  const list = (before[key] && before[key].list) || [];
+  list.push({
+    id: "__pin_test_ws__",
+    rootTabId: 999999,
+    tabIds: [999999],
+    sessionId: s.id,
+    providerId: "x",
+    modelId: "y",
+    createdAt: Date.now(),
+  });
+  await chrome.storage.local.set({ [key]: { list } });
+  // 灌 215 条噪声，把裁剪上限撑满
+  for (let i = 0; i < 215; i++) {
+    const n = mod.newSession("__noise__");
+    n.title = "噪声 " + i;
+    await mod.saveSession(n);
+  }
+  const after = (await chrome.storage.local.get(null)).ai_browser_sessions || [];
+  return { kept: after.some((x) => x.id === s.id), total: after.length, heldId: s.id };
+});
+check(
+  "工作区正在用的会话不会被历史裁剪掉",
+  !pinned.skipped && pinned.kept,
+  JSON.stringify(pinned.skipped ? pinned : { kept: pinned.kept, total: pinned.total })
+);
+
+// ---------- 汇总 ----------
+const failed = results.filter((r) => !r.ok);
+console.log(`\n===== 结果：${results.length - failed.length}/${results.length} 通过 =====`);
+if (failed.length) console.log("失败项：" + failed.map((f) => f.name).join(" | "));
+
+await browser.close();
+server.close();
+process.exit(failed.length ? 1 : 0);

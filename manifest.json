@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "青鸟 · 浏览器助手",
+  "version": "0.6.0",
+  "description": "青鸟殷勤为探看——替你读页面、点按填写、跑腿办事的浏览器 AI 助手。支持多工作区（按页面分身、互不干扰、各自可选模型）、后台任务（等条件满足自动续跑）、自动重试与换模型、记忆自动压缩、截图理解、多厂商多 Key。",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "assets/icon16.png",
+    "32": "assets/icon32.png",
+    "48": "assets/icon48.png",
+    "128": "assets/icon128.png"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  },
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "打开青鸟",
+    "default_icon": {
+      "16": "assets/icon16.png",
+      "32": "assets/icon32.png",
+      "48": "assets/icon48.png",
+      "128": "assets/icon128.png"
+    }
+  },
+  "options_page": "options/index.html"
+}

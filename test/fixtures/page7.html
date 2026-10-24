@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>测试页 7 · 视频与后台任务</title>
+</head>
+<body>
+  <h1>视频等待测试页</h1>
+  <video id="vid" width="200" height="120" controls></video>
+  <div id="videoState">init</div>
+  <button id="nextBtn" type="button">下一节</button>
+  <div id="nextFlag">init</div>
+  <p id="statusText">播放中…</p>
+
+  <script>
+    document.getElementById("nextBtn").addEventListener("click", () => {
+      document.getElementById("nextFlag").textContent = "next-clicked";
+    });
+    // 测试里会手动 dispatch ended 事件来模拟视频播完
+    document.getElementById("vid").addEventListener("ended", () => {
+      document.getElementById("videoState").textContent = "ended";
+      document.getElementById("statusText").textContent = "播放完成";
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>测试页 1</title>
+</head>
+<body>
+  <h1 id="title">测试页 1</h1>
+  <button id="btn" type="button">提交</button>
+  <div id="flag">init</div>
+  <input id="name" placeholder="姓名" />
+  <select id="color">
+    <option value="">选色</option>
+    <option value="r">红</option>
+    <option value="g">绿</option>
+  </select>
+  <label><input type="checkbox" id="agree" /> 同意</label>
+  <p><a id="to2" href="page2.html">去第二页</a></p>
+  <p><a id="pop" href="page2.html" target="_blank">新窗口打开第二页</a></p>
+  <script>
+    window.__clickCount = 0;
+    document.getElementById("btn").addEventListener("click", () => {
+      window.__clickCount++;
+      document.getElementById("flag").textContent = "clicked";
+    });
+  </script>
+</body>
+</html>

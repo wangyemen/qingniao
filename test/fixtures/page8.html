@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>测试页 8 · 提交按钮与勾选框区分</title>
+  <style>
+    body { font: 14px/1.7 "Microsoft YaHei", sans-serif; padding: 16px; }
+    .row { margin: 10px 0; }
+    .submit { background:#14b8a6; color:#fff; border:0; padding:8px 18px; border-radius:6px; }
+    /* 复刻慕课底部：一个"提交"按钮，旁边/同一行有勾选框 */
+    .bar { display:flex; align-items:center; gap:12px; border-top:1px solid #ddd; padding-top:12px; margin-top:16px; }
+    /* 按钮里的图标（16×16 svg），旧实现会把它当"自绘勾选框" */
+    .icon-btn { display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px;
+                border:1px solid #ccc; background:#fafafa; border-radius:4px; cursor:pointer; }
+    .icon-btn svg { width:16px; height:16px; }
+    /* 组件库风格：图标 class 里带 active，旧实现会读出"已勾选" */
+    .icon-active { color:#14b8a6; }
+  </style>
+</head>
+<body>
+  <h1>提交区测试</h1>
+
+  <!-- ① 场景：提交按钮旁边有一个已勾选的复选框（用户 bug 的复现结构） -->
+  <div class="bar" id="bar1">
+    <input type="checkbox" id="agree" checked />
+    <label for="agree">我已确认答案</label>
+    <button type="submit" class="submit" id="submit1">提交</button>
+  </div>
+
+  <!-- ② 场景：按钮内部有 16×16 图标，图标 class 带 active/checked 字样 -->
+  <div class="row">
+    <button type="button" class="icon-btn" id="iconBtn" aria-label="提交">
+      <svg class="icon-checked" viewBox="0 0 24 24"><path d="M4 12l6 6L20 6" fill="none" stroke="#14b8a6" stroke-width="2"/></svg>
+    </button>
+    <span>带图标的提交按钮</span>
+  </div>
+
+  <!-- ③ 场景：自定义提交按钮（div 绑事件、无 role），旁边有复选框 -->
+  <div class="bar" id="bar2">
+    <span class="box" id="fakeBox"></span>
+    <span>同意协议</span>
+    <div id="customSubmit" style="display:inline-block;background:#333;color:#fff;padding:6px 14px;border-radius:4px;cursor:pointer;">提交答案</div>
+  </div>
+
+  <div id="log">init</div>
+
+  <script>
+    window.__submitClicks = 0;
+    document.getElementById("submit1").addEventListener("click", () => {
+      window.__submitClicks++;
+      document.getElementById("log").textContent = "submit-clicked-" + window.__submitClicks;
+    });
+    document.getElementById("iconBtn").addEventListener("click", () => {
+      window.__submitClicks++;
+      document.getElementById("log").textContent = "icon-clicked";
+    });
+    document.getElementById("customSubmit").addEventListener("click", () => {
+      window.__submitClicks++;
+      document.getElementById("log").textContent = "custom-clicked";
+    });
+    // 自绘小方块：class 表达状态（旧实现会当勾选框，这里故意让它"已勾选"）
+    document.getElementById("fakeBox").classList.add("checked");
+    document.getElementById("fakeBox").style.cssText =
+      "display:inline-block;width:16px;height:16px;border:1px solid #999;background:#14b8a6;vertical-align:middle;";
+  </script>
+</body>
+</html>

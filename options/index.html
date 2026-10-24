@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>青鸟 · 设置</title>
+  <link rel="icon" href="../assets/icon32.png" />
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="page-head">
+      <div class="brand">
+        <img src="../assets/icon48.png" alt="青鸟" />
+        <h1>青鸟 · 设置</h1>
+      </div>
+      <p class="sub">青鸟殷勤为探看。管理供应商、模型与 API Key；同一供应商可添加多个 Key，请求失败时自动切换，重试仍失败会自动换下一个模型。</p>
+    </header>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>供应商</h2>
+        <button id="addProviderBtn" class="primary">+ 添加供应商</button>
+      </div>
+      <div id="providerList" class="provider-list"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>默认选项</h2>
+      </div>
+      <div class="row">
+        <label class="field">
+          <span>默认供应商</span>
+          <select id="defaultProvider"></select>
+        </label>
+        <label class="field">
+          <span>默认模型</span>
+          <select id="defaultModel"></select>
+        </label>
+      </div>
+      <div class="row">
+        <label class="check">
+          <input type="checkbox" id="contextEnabled" checked />
+          <span>对话时自动带上当前页面上下文</span>
+        </label>
+      </div>
+      <div class="row">
+        <label class="field">
+          <span>上下文上限（tokens）</span>
+          <input type="number" id="contextWindow" min="1000" step="1000" placeholder="128000" />
+        </label>
+        <label class="field">
+          <span>自动压缩阈值（%）</span>
+          <input type="number" id="autoCompressAt" min="50" max="98" step="1" placeholder="90" />
+        </label>
+      </div>
+      <p class="hint">
+        上下文用量达到「阈值」时，会自动把较早的历史压成一份摘要（保留最近几轮原文），
+        以免超出模型上限。默认 128000 tokens / 90%。
+      </p>
+    </section>
+
+    <footer class="page-foot">
+      <span id="saveStatus" class="save-status"></span>
+      <button id="saveBtn" class="primary">保存设置</button>
+    </footer>
+  </div>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>

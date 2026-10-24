@@ -1,0 +1,23 @@
+# 忽略构建产物与本地运行痕迹
+dist/
+*.zip
+
+# 测试输出与临时日志
+test/artifacts/
+*.log
+
+# 事故恢复材料（本地保留，不入库）
+test/_recovery/
+
+# 损坏待恢复的旧测试套件（恢复后再入库，避免公开仓库出现乱码文件）
+test/e2e.mjs
+
+# 内部工作记录（本地保留，不入库）
+.workbuddy/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

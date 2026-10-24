@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>富文本编辑器测试页</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .pm {
+      min-height: 80px;
+      border: 1px solid #ccc;
+      padding: 8px;
+      margin: 10px 0;
+    }
+    .pm:empty::before { content: attr(data-placeholder); color: #999; }
+    #log { font-family: monospace; white-space: pre; }
+  </style>
+</head>
+<body>
+  <h1>富文本编辑器测试页</h1>
+
+  <!-- 普通输入框 -->
+  <label>普通输入框 <input id="plain" placeholder="请输入" /></label>
+
+  <!-- 模拟 ProseMirror：内部维护 model，只在收到 input 事件时同步，
+       直接改 DOM（textContent）不会被它接受 —— 这正是"填不进去"的真实场景 -->
+  <div id="pm" class="pm ProseMirror" contenteditable="true" data-placeholder="写点评论…"></div>
+
+  <!-- 藏在 shadow DOM 里的输入框：document.querySelectorAll 看不到它 -->
+  <div id="shadowHost"></div>
+
+  <!-- 折叠面板里的输入框：默认不可见，展开后才出现 -->
+  <button id="toggle" type="button">展开更多</button>
+  <div id="panel" style="display:none">
+    <input id="hidden" placeholder="折叠里的输入框" />
+  </div>
+
+  <div id="log"></div>
+  <div id="state">init</div>
+
+  <script>
+    // --- ProseMirror 模拟 ---
+    const pm = document.getElementById("pm");
+    let model = "";              // 编辑器内部状态
+    window.__pmModel = () => model;
+    window.__pmDomText = () => pm.textContent;
+
+    pm.addEventListener("input", (e) => {
+      // 真实编辑器在这里把 DOM 同步进 model；我们模拟成"只有收到 input 事件才算数"
+      model = pm.textContent;
+      log("input event, model=" + JSON.stringify(model));
+    });
+    // 如果有人绕过事件直接改 DOM，编辑器会在下一次渲染时冲掉
+    window.__pmReset = () => { pm.textContent = model; };
+
+    // --- shadow DOM 里的输入框 ---
+    const host = document.getElementById("shadowHost");
+    const root = host.attachShadow({ mode: "open" });
+    root.innerHTML = '<input id="shadowInput" placeholder="Shadow 里的输入框" />';
+    window.__shadowValue = () => root.getElementById("shadowInput").value;
+
+    // --- 折叠面板 ---
+    document.getElementById("toggle").addEventListener("click", () => {
+      const p = document.getElementById("panel");
+      p.style.display = p.style.display === "none" ? "block" : "none";
+    });
+
+    function log(s) {
+      const el = document.getElementById("log");
+      el.textContent += s + "\n";
+    }
+  </script>
+</body>
+</html>

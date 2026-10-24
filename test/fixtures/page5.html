@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>图标按钮与内层滚动测试页</title>
+<style>
+  body { margin: 0; font: 14px/1.6 "Microsoft YaHei", sans-serif; background: #f7f8fa; }
+  .bar { background: #232a35; color: #fff; padding: 10px 16px; display: flex; gap: 8px; }
+  .bar button { background: #3a4453; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+  /* 关键结构：内容在内层可滚动容器里，滚 window 纹丝不动（复刻慕课/知乎结构） */
+  #shell { height: 420px; overflow-y: auto; }
+  #inner { padding: 16px; }
+  .card { background: #fff; border: 1px solid #e3e6eb; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  /* 图标按钮：肉眼只有图标，文字在 aria-label / svg title 里 */
+  .icon-btn { width: 30px; height: 30px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;
+              display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+  .icon-btn svg { width: 16px; height: 16px; }
+  .icon-btn.plain { border: 0; background: transparent; }
+  .panel { height: 150px; overflow-y: auto; border: 1px dashed #bbb; padding: 8px; margin-top: 10px; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <button id="home">首页</button>
+    <button id="course">课程中心</button>
+    <!-- 纯图标按钮：aria-label 有名字（模型原本看不到） -->
+    <button class="icon-btn" id="searchBtn" aria-label="搜索课程">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="#555" stroke-width="2"/><line x1="16" y1="16" x2="21" y2="21" stroke="#555" stroke-width="2"/></svg>
+    </button>
+    <!-- 名字藏在 svg <title> 里（更隐蔽） -->
+    <button class="icon-btn" id="bellBtn">
+      <svg viewBox="0 0 24 24"><title>消息通知</title><path d="M6 16V11a6 6 0 1112 0v5l2 3H4z" fill="#666"/></svg>
+    </button>
+    <!-- 完全没名字：只有 iconfont class，模型只能靠 a11y 的图标提示认出来 -->
+    <button class="icon-btn plain" id="starBtn"><i class="iconfont icon-star"></i></button>
+  </div>
+
+  <div id="shell">
+    <div id="inner">
+      <h2>刑法分论 · 中国大学MOOC（慕课）</h2>
+      <div id="cards"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div>下面是一个独立的小滚动区（第二个可滚动容器）：</div>
+    <div class="panel" id="panel"><div id="panelInner"></div></div>
+  </div>
+
+<script>
+  // 造足够多的内容，把内层容器撑到可滚动
+  const cards = document.getElementById("cards");
+  for (let i = 0; i < 30; i++) {
+    const d = document.createElement("div");
+    d.className = "card";
+    d.innerHTML = `<b>第 ${i + 1} 讲 · 犯罪构成</b><div>内容占位，用于把内层容器撑高。</div>
+      <div class="row">
+        <button class="icon-btn" aria-label="点赞第${i+1}讲"><svg viewBox="0 0 24 24"><path d="M7 22V10l5-8 1 1v6h6l-2 13z" fill="#e88"/></svg></button>
+        <button class="icon-btn" aria-label="收藏第${i+1}讲"><svg viewBox="0 0 24 24"><path d="M12 3l3 7h7l-5 5 2 7-7-4-7 4 2-7-5-5h7z" fill="#e8b800"/></svg></button>
+        <span>第 ${i + 1} 讲</span>
+      </div>`;
+    cards.appendChild(d);
+  }
+  const pi = document.getElementById("panelInner");
+  for (let i = 0; i < 12; i++) {
+    const d = document.createElement("div");
+    d.textContent = "小面板内容 " + (i + 1);
+    pi.appendChild(d);
+  }
+  document.getElementById("searchBtn").addEventListener("click", () => window.__clicked = (window.__clicked || "") + "search;");
+  document.getElementById("bellBtn").addEventListener("click", () => window.__clicked = (window.__clicked || "") + "bell;");
+  document.getElementById("starBtn").addEventListener("click", () => window.__clicked = (window.__clicked || "") + "star;");
+  window.__scrollState = () => ({
+    winY: Math.round(window.scrollY),
+    shellTop: Math.round(document.getElementById("shell").scrollTop),
+    shellMax: document.getElementById("shell").scrollHeight - document.getElementById("shell").clientHeight,
+    panelTop: Math.round(document.getElementById("panel").scrollTop),
+    panelMax: document.getElementById("panel").scrollHeight - document.getElementById("panel").clientHeight,
+    clicked: window.__clicked || "",
+  });
+</script>
+</body>
+</html>

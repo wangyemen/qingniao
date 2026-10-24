@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>课堂交流区 - 回复测试页</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .reply { padding: 12px 0; border-bottom: 1px solid #eee; }
+    .acts { margin-top: 6px; }
+    .acts button { margin-right: 8px; font-size: 12px; }
+
+    /* 场景 1：自绘复选框（最常见的库实现方式）
+       真实 input 完全透明（opacity:0），用户看到的是旁边 CSS 画出来的方块 */
+    .fake-cb { position: relative; display: inline-block; width: 16px; height: 16px; vertical-align: middle; }
+    .fake-cb input { position: absolute; opacity: 0; width: 16px; height: 16px; margin: 0; cursor: pointer; }
+    .fake-cb .box {
+      position: absolute; inset: 0; border: 1px solid #bbb; border-radius: 3px; background: #fff;
+      pointer-events: none;
+    }
+    .fake-cb input:checked + .box { background: #14b8a6; border-color: #14b8a6; }
+    .fake-cb input:checked + .box::after {
+      content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px;
+      border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg);
+    }
+    .row { margin: 14px 0; }
+
+    /* 场景 2：div[role=checkbox] 自绘开关 */
+    .sw {
+      display: inline-block; width: 32px; height: 18px; border-radius: 9px; background: #ddd;
+      position: relative; cursor: pointer; vertical-align: middle;
+    }
+    .sw::after {
+      content: ""; position: absolute; width: 14px; height: 14px; border-radius: 50%;
+      background: #fff; top: 2px; left: 2px; transition: left .15s;
+    }
+    .sw[aria-checked="true"] { background: #14b8a6; }
+    .sw[aria-checked="true"]::after { left: 16px; }
+
+    /* 场景 3：class 表达状态的勾选框（没有 input、没有 role、没有 aria） */
+    .boxy { display:inline-block; width:16px; height:16px; border:1px solid #999; vertical-align:middle; }
+    .boxy.checked { background:#14b8a6; }
+
+    /* 场景 4：普通原生 checkbox */
+    .native { width: 15px; height: 15px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <h1>课堂交流区</h1>
+  <p>共 27 个回复</p>
+
+  <!-- 真实场景：大量回复列表在上方（几百个按钮），回复框和"匿名发表"在页面最底部 -->
+  <div id="replies"></div>
+
+  <!-- ===== 回复区（页面底部）===== -->
+  <div id="editorBox" style="margin-top:30px;border-top:1px solid #ccc;padding-top:12px;">
+    <h3>发表回复</h3>
+    <div id="editor" contenteditable="true" data-placeholder="写点什么…" style="min-height:70px;border:1px solid #ddd;padding:8px;"></div>
+
+    <div class="row" style="margin-top:12px;">
+      <!-- 场景 1：透明 input + CSS 方块（用户截图里"匿名发表"就是这种） -->
+      <label class="fake-cb">
+        <input type="checkbox" id="anon" />
+        <span class="box"></span>
+      </label>
+      <span>匿名发表</span>
+    </div>
+
+    <div class="row">
+      <!-- 场景 2：div[role=checkbox] + aria-checked -->
+      <span class="sw" id="sw" role="checkbox" aria-checked="false" tabindex="0"></span>
+      <span>开启提醒</span>
+    </div>
+
+    <div class="row">
+      <!-- 场景 3：class 表达状态（没有任何语义属性） -->
+      <span class="boxy" id="boxy"></span>
+      <span>仅自己可见</span>
+    </div>
+
+    <div class="row">
+      <!-- 场景 4：普通原生 checkbox -->
+      <input type="checkbox" id="native" class="native" />
+      <label for="native">订阅更新</label>
+    </div>
+
+    <button id="submit" style="background:#14b8a6;color:#fff;border:0;padding:8px 18px;border-radius:6px;">发表回复</button>
+  </div>
+
+  <script>
+    // 状态读取接口（给测试用）
+    window.__states = () => ({
+      anon: document.getElementById("anon").checked,
+      sw: document.getElementById("sw").getAttribute("aria-checked"),
+      boxy: document.getElementById("boxy").classList.contains("checked"),
+      native: document.getElementById("native").checked,
+    });
+    window.__submitClicks = 0;
+    document.getElementById("submit").addEventListener("click", () => { window.__submitClicks++; });
+    window.__editorText = () => document.getElementById("editor").textContent;
+
+    // 场景 2 的点击处理（组件库风格：只认 click 事件，绑在外壳上）
+    document.getElementById("sw").addEventListener("click", function () {
+      this.setAttribute("aria-checked", this.getAttribute("aria-checked") === "true" ? "false" : "true");
+    });
+
+    // 场景 3 的点击处理（只改 class）
+    document.getElementById("boxy").addEventListener("click", function () {
+      this.classList.toggle("checked");
+    });
+
+    // 造 27 条回复 × 每条 15 个按钮 = 405 个元素，模拟"元素太多把底部控件挤掉"的真实页面
+    const box = document.getElementById("replies");
+    let html = "";
+    for (let r = 1; r <= 27; r++) {
+      html += `<div class="reply"><b>用户${r}</b><p>这是第 ${r} 条回复的内容。</p><div class="acts">`;
+      for (let b = 0; b < 15; b++) {
+        html += `<button type="button">操作${b}</button>`;
+      }
+      html += `</div></div>`;
+    }
+    box.innerHTML = html;
+  </script>
+</body>
+</html>

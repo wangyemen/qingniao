@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>青鸟</title>
+  <link rel="icon" href="../assets/icon32.png" />
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <!-- 背景氛围光斑（缓慢漂浮） -->
+  <div class="ambient" aria-hidden="true">
+    <span class="blob b1"></span>
+    <span class="blob b2"></span>
+  </div>
+
+  <header class="toolbar">
+    <div class="toolbar-row">
+      <img class="brand-mark" src="../assets/icon32.png" alt="青鸟" title="青鸟 · 浏览器助手" />
+      <select id="modelSelect" title="选择模型"></select>
+      <div class="icon-group">
+        <button id="historyBtn" class="icon-btn" title="历史会话">
+          <svg viewBox="0 0 24 24"><path d="M12 5a7 7 0 1 1-7 7" /><path d="M5 5v4h4" /><path d="M12 8v4l3 2" /></svg>
+        </button>
+        <button id="newChatBtn" class="icon-btn" title="新对话">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
+        </button>
+        <button id="settingsBtn" class="icon-btn" title="设置">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7 7 0 0 0-2-1.2L14.2 3h-4l-.4 2.7a7 7 0 0 0-2 1.2l-2.3-1-2 3.4 2 1.5A7 7 0 0 0 5 12c0 .4 0 .8.1 1.2l-2 1.5 2 3.4 2.3-1a7 7 0 0 0 2 1.2l.4 2.7h4l.4-2.7a7 7 0 0 0 2-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2Z" /></svg>
+        </button>
+      </div>
+    </div>
+    <div class="toolbar-row toolbar-sub">
+      <label class="pill-toggle" title="对话时带上当前页面内容">
+        <input type="checkbox" id="ctxToggle" checked />
+        <span class="pill"><i></i>页面</span>
+      </label>
+      <label class="pill-toggle" id="ctlWrap" title="允许 AI 操作页面（点击/填写/跳转），默认每步需确认">
+        <input type="checkbox" id="ctlToggle" checked />
+        <span class="pill"><i></i>操作</span>
+      </label>
+      <label class="pill-toggle" id="autoWrap" title="动作自动执行，不再逐步确认（谨慎开启）">
+        <input type="checkbox" id="autoToggle" />
+        <span class="pill"><i></i>自动</span>
+      </label>
+      <label class="pill-toggle" id="shotWrap" title="发送时截取一次当前屏幕，仅支持图片理解的模型">
+        <input type="checkbox" id="shotToggle" />
+        <span class="pill"><i></i>截图</span>
+      </label>
+      <label class="pill-toggle" title="深度思考（thinking）模式，回答更深入但更慢">
+        <input type="checkbox" id="thinkToggle" checked />
+        <span class="pill"><i></i>思考</span>
+      </label>
+    </div>
+    <div class="toolbar-row">
+      <span id="ctxInfo" class="ctx-info"></span>
+    </div>
+  </header>
+
+  <!-- 工作区切换条：多个工作区并存时出现，点一下切到那个工作区 -->
+  <div id="wsBar" class="ws-bar hidden"></div>
+
+  <!-- 手动并入：当前页不属于任何工作区、但已有工作区时，允许把它并进其中一份 -->
+  <div id="mergeBar" class="merge-bar hidden"></div>
+
+  <!-- 后台任务提示：AI 挂起等待条件（如视频播完），条件满足自动继续 -->
+  <div id="deferChip" class="defer-chip hidden">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
+    <span id="deferChipText">后台任务等待中…</span>
+    <button id="deferCancelBtn" class="tiny defer-cancel-btn" title="取消这个后台任务">取消</button>
+  </div>
+
+  <!-- 历史会话抽屉 -->
+  <aside id="historyPanel" class="history-panel hidden">
+    <div class="history-head">
+      <span>历史会话</span>
+      <button id="historyCloseBtn" class="tiny">关闭</button>
+    </div>
+    <div id="historyList" class="history-list"></div>
+  </aside>
+
+  <!-- 每个工作区自己一份 chat DOM，切页时整体换上来 -->
+  <main id="chatHost" class="chat-host"></main>
+
+  <footer class="composer">
+    <div id="attachList" class="attach-list"></div>
+    <div class="composer-box">
+      <textarea
+        id="input"
+        rows="2"
+        placeholder="输入消息，Enter 发送；可粘贴图片、上传文档"
+      ></textarea>
+      <div class="composer-row">
+        <button id="attachBtn" class="icon-btn" title="上传图片或文档（图片/PDF/TXT/MD/CSV/JSON/代码）">
+          <svg viewBox="0 0 24 24"><path d="M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3.5 3.5 0 0 1 5 5L10.5 19a2 2 0 0 1-3-3l8-8" /></svg>
+        </button>
+        <input type="file" id="fileInput" multiple hidden accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.js,.ts,.py,.html,.css,.xml,.yaml,.yml" />
+        <span id="status" class="status"></span>
+        <button id="sendBtn" class="send-btn" title="发送">
+          <svg class="ic-send" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6" /></svg>
+          <svg class="ic-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" /></svg>
+        </button>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>
