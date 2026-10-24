@@ -81,6 +81,19 @@ body {
 .page-head .brand h1 {
   margin: 0;
 }
+/* 版本标记：用来确认加载的是哪一版构建 */
+.page-head .ver-badge {
+  align-self: center;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--accent-2, #2dd4bf);
+  background: rgba(45, 212, 191, 0.12);
+  border: 1px solid rgba(45, 212, 191, 0.28);
+  border-radius: 999px;
+  padding: 2px 8px;
+  flex: 0 0 auto;
+}
 .page-head .sub {
   color: var(--text-soft);
   margin: 0 0 22px;

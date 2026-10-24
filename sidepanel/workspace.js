@@ -308,6 +308,7 @@ export class WorkspaceRuntime {
         <img src="../assets/icon128.png" alt="青鸟" />
       </div>
       <h3>青鸟</h3>
+      <div class="ver-note"></div>
       <p class="sub">对着当前网页提问，或让我直接操作页面</p>
       <div class="suggestions">
         <button data-fill="总结一下当前页面的要点">总结当前页面</button>
@@ -316,6 +317,11 @@ export class WorkspaceRuntime {
         <button data-fill="帮我点击页面上的关键操作，并说明每一步">代我操作</button>
       </div>`;
     this.chatEl.appendChild(this.emptyHintEl);
+    // 版本标记：方便确认"跑的是不是最新构建"
+    try {
+      const vn = this.emptyHintEl.querySelector(".ver-note");
+      if (vn) vn.textContent = "v" + chrome.runtime.getManifest().version;
+    } catch (_) {}
     // 快捷建议：只改输入框，不自动发送
     for (const b of this.emptyHintEl.querySelectorAll(".suggestions button")) {
       b.addEventListener("click", () => {

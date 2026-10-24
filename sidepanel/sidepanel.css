@@ -514,6 +514,19 @@ select:focus {
   flex: 0 0 auto;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
 }
+/* 版本标记：用来确认加载的是哪一版构建 */
+.empty-hint .ver-note {
+  display: inline-block;
+  margin: 0 0 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--accent-2);
+  background: rgba(45, 212, 191, 0.12);
+  border: 1px solid rgba(45, 212, 191, 0.26);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
 .empty-hint h3 {
   margin: 0 0 4px;
   font-size: 15px;

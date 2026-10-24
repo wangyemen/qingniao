@@ -728,6 +728,7 @@ function activatePending(tabId, tab) {
         <img src="../assets/icon128.png" alt="青鸟" />
       </div>
       <h3>青鸟</h3>
+      <div class="ver-note">v${APP_VERSION}</div>
       <p class="sub">对着当前网页提问，或让我直接操作页面<br/><span class="pending-note">发送第一条消息时会为这个页面建立独立工作区</span></p>
       <div class="suggestions">
         <button data-fill="总结一下当前页面的要点">总结当前页面</button>
@@ -1106,6 +1107,15 @@ function startNewChat() {
   saveSession(sess).catch(() => {});
   inputEl.focus();
 }
+
+// 版本号：显示在界面上，方便确认"当前跑的是不是最新构建"
+const APP_VERSION = (() => {
+  try {
+    return chrome.runtime.getManifest().version;
+  } catch (_) {
+    return "";
+  }
+})();
 
 // 改设置：**先读回外部改动再合并**，再写。
 // 直接 saveSettings(settings) 会把面板内存里的整份设置写回去，覆盖掉设置页刚改的东西

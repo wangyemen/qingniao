@@ -22,6 +22,11 @@ init();
 
 async function init() {
   settings = await getSettings();
+  // 版本标记：一眼看出"现在跑的是不是最新构建"
+  try {
+    const badge = document.getElementById("verBadge");
+    if (badge) badge.textContent = "v" + chrome.runtime.getManifest().version;
+  } catch (_) {}
   render();
   addProviderBtn.addEventListener("click", addProvider);
   saveBtn.addEventListener("click", save);
