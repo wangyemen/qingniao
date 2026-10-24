@@ -103,9 +103,9 @@ async function fetchMarket({ silent } = {}) {
       lastCount: market.count,
       lastError: "",
     });
-    $("marketMeta").textContent = `已同步 ${market.count} 个技能 · ${fmtTime(Date.now())} · ${market.base}`;
+    $("marketMeta").textContent = `已同步 ${market.count} 个技能 · ${fmtTime(Date.now())} · 来源：${market.label}`;
     renderMarket();
-    if (!silent) setStatus(`获取成功：${market.count} 个技能`, "ok");
+    if (!silent) setStatus(`获取成功：${market.count} 个技能（${market.label}）`, "ok");
   } catch (err) {
     market = null;
     await saveMarketSettings({ source: input, lastError: String((err && err.message) || err) });
@@ -205,7 +205,7 @@ async function copySkillPromptFromMarket(m) {
 async function previewMarketSkill(m) {
   try {
     setStatus("正在下载技能正文…");
-    const { text } = await fetchSkillMd(market.base, m);
+    const { text } = await fetchSkillMd(market.bases || market.base, m);
     const { meta, body } = parseSkillMd(text);
     showPreviewDialog(makeSkill({ meta, body, fallbackId: m.id }));
     setStatus("");
@@ -220,7 +220,7 @@ async function installMarketSkill(m, btn) {
       btn.disabled = true;
       btn.textContent = "安装中…";
     }
-    const { text, url } = await fetchSkillMd(market.base, m);
+    const { text, url } = await fetchSkillMd(market.bases || market.base, m);
     const { meta, body } = parseSkillMd(text);
     const skill = makeSkill({ meta, body, fallbackId: m.id });
     if (!skill.id) throw new Error("技能缺少 name 字段");
