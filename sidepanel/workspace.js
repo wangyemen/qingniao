@@ -782,7 +782,9 @@ export class WorkspaceRuntime {
     }
 
     const name = String(action.name || "自动化任务").slice(0, 30);
-    const repeat = Math.max(1, Math.min(500, Number(action.repeat) > 0 ? Math.round(Number(action.repeat)) : 1));
+    // 轮数：这是**安全上限**，不是"预计页数" —— 正常应该让它靠 until/停滞自动停。
+    // 漏写时默认 20（默认 1 就等于"自动化只跑一轮"，几乎没用；踩过这个坑）。
+    const repeat = Math.max(1, Math.min(500, Number(action.repeat) > 0 ? Math.round(Number(action.repeat)) : 20));
     const maxMs = Math.max(1000, Math.min(600000, Number(action.maxMs) > 0 ? Number(action.maxMs) : 180000));
     const intervalMs = Math.max(0, Math.min(20000, Number(action.intervalMs) >= 0 ? Number(action.intervalMs) : 250));
     const stallLimit = Math.max(1, Math.min(20, Number(action.stallLimit) > 0 ? Number(action.stallLimit) : 3));
@@ -845,7 +847,7 @@ export class WorkspaceRuntime {
       deferred: true,
       taskId,
       automation: true,
-      msg: `已开始自动化任务「${name}」（最多 ${repeat} 轮，循环在侧栏这侧跑，可随时点横条取消）`,
+      msg: `已开始自动化任务「${name}」（安全上限 ${repeat} 轮；到尽头 / 页面不动了会自动停，可点横条取消）`,
     };
   }
 
