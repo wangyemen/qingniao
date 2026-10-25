@@ -1,7 +1,13 @@
 青鸟 · 浏览器助手 —— 更新日志
-latest: 0.4.2
+latest: 0.4.3
 released: 2026-10-25
 repo: https://github.com/wangyemen/qingniao
+
+## 0.4.3
+- 改进：技能目录与更新检查**优先走 GitHub API（实时）**，镜像只做兜底
+  · 原因：jsDelivr 对 `@main` 这类分支地址会**缓存最多 12 小时** —— 刚加的技能、刚改的版本号要等半天才看得到
+  · 来源顺序：GitHub API → jsDelivr → jsDelivr(Fastly) → GitHub 原始地址
+- 改进：拉取失败时**自动重试一次**（CDN 抖动/被限流是常态，重试一下往往就好了）
 
 ## 0.4.2
 - 重做：**自动化任务**（"点一下等两秒循环 3 次""PPT 逐页翻到底"这类重复动作，交给程序跑循环）
