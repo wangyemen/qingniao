@@ -197,6 +197,8 @@ const runtimeCtx = {
   },
   saveSession: (s) => saveSession(s),
   persist: () => persistAll(),
+  // 工作区里的标签页变了（AI newtab / closetab）→ 刷新顶部的切换条
+  renderWsBar: () => renderWsBar(),
   markBusy: (wsId, on) => markBusy(wsId, on),
   // 用户此刻正在看的标签页（决定"这一轮该操作哪一页"）。
   // 不直接用缓存的 pendingTabId：headless / 多窗口下 lastFocusedWindow 可能滞后，

@@ -1745,10 +1745,14 @@
   function readEditableText(el) {
     try {
       const t = el.innerText != null && el.innerText !== "" ? el.innerText : el.textContent;
-      // 去掉 &nbsp; 和零宽字符，否则和期望值永远对不上
+      // ⚠️ 这里**必须保留换行**：以前把 \s+ 全压成空格，
+      //    导致"多行内容被写成一行"根本校验不出来（用户反馈的换行丢失就是这么溜过去的）。
+      //    只归一：\r\n → \n、不间断空格/零宽字符 → 普通空格、去掉行尾空白。
       return String(t || "")
+        .replace(/\r\n?/g, "\n")
         .replace(/[\u00a0\u200b\ufeff]/g, " ")
-        .replace(/\s+/g, " ")
+        .replace(/[ \t]+$/gm, "")
+        .replace(/\n{3,}/g, "\n\n")
         .trim();
     } catch (_) {
       return "";
@@ -1771,33 +1775,79 @@
     }
   }
 
+  // 在富文本里插入一个"真正的换行"：
+  // 先派发 Enter 键事件（ProseMirror / Quill / Lexical 这类靠键盘事件维护内部状态），
+  // 编辑器没接（DOM 没变）才用 insertParagraph / insertLineBreak / <br> 兜底。
+  // ⚠️ 直接把 "\n" 塞给 insertText 或 textContent 是不行的 —— 在 HTML 里会被当空格渲染，
+  //    表现就是"多行内容变成一行"（用户反馈过）。
+  function insertEditableNewline(el, doc) {
+    const before = (el.innerHTML || "").length;
+    try {
+      const common = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+      const down = new KeyboardEvent("keydown", common);
+      el.dispatchEvent(down);
+      el.dispatchEvent(new KeyboardEvent("keypress", common));
+      el.dispatchEvent(new KeyboardEvent("keyup", common));
+      if (down.defaultPrevented) return true; // 编辑器自己处理了
+    } catch (_) {}
+    if ((el.innerHTML || "").length !== before) return true; // 编辑器自己插入了东西
+    for (const cmd of ["insertParagraph", "insertLineBreak"]) {
+      try {
+        if (doc.execCommand(cmd)) return true;
+      } catch (_) {}
+    }
+    try {
+      return !!doc.execCommand("insertHTML", false, "<br>");
+    } catch (_) {
+      return false;
+    }
+  }
+
   function fillContentEditable(el, text) {
     const doc = el.ownerDocument || document;
     focusEl(el);
-    // 选中全部既有内容，随后 insertText 会替换掉它
+    // 选中全部既有内容，随后插入会替换掉它
     selectAllIn(el);
-    let ok = false;
-    try {
-      ok = !!doc.execCommand("insertText", false, text);
-    } catch (_) {
-      ok = false;
-    }
-    if (!ok) {
-      // 退化路径：直接改 DOM + 补发 input 事件（至少让简单编辑器认）
-      el.textContent = text;
+
+    const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+    // 单行：一次插入就够（快）
+    if (lines.length === 1) {
+      let ok = false;
       try {
-        el.dispatchEvent(
-          new InputEvent("input", {
-            bubbles: true,
-            inputType: "insertText",
-            data: text,
-          })
-        );
+        ok = !!doc.execCommand("insertText", false, lines[0]);
+      } catch (_) {
+        ok = false;
+      }
+      if (ok) return true;
+      el.textContent = lines[0];
+      try {
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: lines[0] }));
       } catch (_) {
         el.dispatchEvent(new Event("input", { bubbles: true }));
       }
+      return false;
     }
-    return ok;
+
+    // 多行：**按行插入**，行与行之间用真正的换行（Enter / insertParagraph / <br>）
+    try {
+      doc.execCommand("delete");
+    } catch (_) {}
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) insertEditableNewline(el, doc);
+      if (lines[i]) {
+        try {
+          if (!doc.execCommand("insertText", false, lines[i])) throw new Error("insertText failed");
+        } catch (_) {
+          el.appendChild(doc.createTextNode(lines[i]));
+        }
+      }
+    }
+    try {
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+    } catch (_) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    return true;
   }
 
   // 拟人打字节奏：每个字符之间随机停顿，标点后停久一点，偶尔"想一下"。
@@ -1843,6 +1893,16 @@
 
     for (let i = 0; i < chars.length; i++) {
       const ch = chars[i];
+
+      // 换行：**按 Enter 处理**（以前给的是 KeyboardEvent({key:"\n"})，等于什么都没发生，
+      // 所以 type / fill human 写多行内容会被吞成一行）
+      if (ch === "\n") {
+        insertEditableNewline(el, doc);
+        let waitNl = rand(prof.min, prof.max) * (PUNCT_PAUSE["\n"] || 2);
+        await autoSleep(waitNl);
+        continue;
+      }
+
       const code = ch.charCodeAt(0);
       const keyOpts = {
         key: ch,
@@ -1930,16 +1990,35 @@
   }
 
   // 回读验证：动作"发出"不等于"生效"（借鉴 Kimi 的点击投递探针思路）
+  //
+  // ⚠️ 这里**必须把换行当有效内容**：以前最后一句是 `got.replace(/\s+/g,"") === want.replace(/\s+/g,"")`，
+  //    把所有空白（含换行）都抹掉再比 —— 于是"# 标题一\n## 标题二"被写成一行也判定为成功，
+  //    换行丢失永远不会报错（用户反馈的 bug 就是这么静默溜过去的）。
+  //    现在：普通输入框严格比对；富文本把结构换行归一成 \n 后**逐行**比对（只忽略行首尾缩进）。
   function verifyFilled(el, text) {
-    const want = String(text || "").trim();
-    if (!want) return true;
-    const got = el.tagName.toLowerCase() === "input" || el.tagName.toLowerCase() === "textarea"
-      ? String(el.value || "").trim()
-      : readEditableText(el);
-    if (!got) return false;
-    if (got === want) return true;
-    // 富文本编辑器常在末尾留一个 <br> / 换行，宽松包含即可
-    return got.replace(/\s+/g, "") === want.replace(/\s+/g, "");
+    const isPlain = ["input", "textarea"].includes(el.tagName.toLowerCase());
+    const normNl = (s) =>
+      String(s == null ? "" : s)
+        .replace(/\r\n?/g, "\n")
+        .replace(/[\u00a0\u200b\ufeff]/g, " ");
+    const wantRaw = normNl(text).trim();
+    if (!wantRaw) return true;
+    const gotRaw = normNl(isPlain ? el.value || "" : readEditableText(el)).trim();
+    if (!gotRaw) return false;
+    if (gotRaw === wantRaw) return true;
+
+    if (isPlain) return false;
+
+    // 富文本：逐行比较（忽略每行首尾缩进和末尾多余空行，但不允许"行被合并"）
+    const toLines = (s) =>
+      s
+        .split("\n")
+        .map((l) => l.replace(/[ \t]+/g, " ").trim())
+        .filter((l, i, arr) => !(l === "" && (i === 0 || i === arr.length - 1))); // 只去首尾空行
+    const w = toLines(wantRaw);
+    const g = toLines(gotRaw);
+    if (w.length !== g.length) return false;
+    return w.every((l, i) => l === g[i]);
   }
 
   // ===== 动作执行 =====
@@ -2002,16 +2081,25 @@
               return { ok: true, msg: `已填入「${clip(v, 30)}」（逐字输入）` };
             }
           }
+          const wantLines = String(v || "").split("\n").length;
+          const gotLines = readEditableText(el).split("\n").length;
           return {
             ok: false,
-            msg: `已尝试写入「${clip(v, 30)}」，但页面没有接受这次输入`,
+            msg:
+              `已尝试写入「${clip(v, 30)}」，但页面没有接受这次输入` +
+              (wantLines > 1 ? `（期望 ${wantLines} 行，实际读到 ${gotLines} 行 —— 换行没写进去）` : ""),
             hint:
-              "如果这是富文本编辑器：先对该元素执行 click 让它获得焦点，再重试 fill；" +
+              (wantLines > 1
+                ? "这是富文本编辑器且换行没生效：确认 value 里用的是 \\n；本扩展会按行插入真正的换行（Enter / insertParagraph）。"
+                : "如果这是富文本编辑器：先对该元素执行 click 让它获得焦点，再重试 fill；") +
               "若它在 iframe / shadow DOM 里，也先点一下再试。仍不行就用 extract 看看它当前内容，" +
               "必要时改用 type 逐字输入（要更慢更逼真可加 \"human\":true 与 \"speed\":\"slow\"）。",
           };
         }
-        return { ok: true, msg: `已填入「${clip(v, 30)}」` };
+        return {
+          ok: true,
+          msg: `已填入「${clip(v, 30)}」${String(v).includes("\n") ? `（${String(v).split("\n").length} 行）` : ""}`,
+        };
       }
       case "type": {
         // 逐字输入：给那些只认真人按键流的编辑器（评论框、聊天输入、快捷指令框），

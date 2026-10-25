@@ -30,7 +30,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------- 本地测试页 ----------
 const server = http.createServer((req, res) => {
   const name = path.basename(String(req.url || "").split("?")[0].split("#")[0]);
-  const allowed = new Set(["page1.html", "page2.html", "page9.html", "page10.html"]);
+  const allowed = new Set(["page1.html", "page2.html", "page9.html", "page10.html", "page11.html"]);
   if (!allowed.has(name)) {
     res.writeHead(404);
     res.end("nf");
@@ -1214,12 +1214,229 @@ await pageB.evaluate(() => {
 await pageAuto.close().catch(() => {});
 await sleep(300);
 
+// ---------- ㉒ 多标签页（tab 参数不串页）+ 富文本换行 ----------
+// 用户要求：
+//   ① AI 能新开一个标签页（后台静默、并入本工作区、共用同一份对话），干完活再回来
+//   ② AI 每个动作可带 tab 参数指定打在哪一页 → 用户切页也不影响它干活，两页不能串
+//   ③ closetab 只能关 AI 自己开的页
+//   ④ 富文本多行内容要按行插入（不能压成一行）
+const pageRt = await browser.newPage();
+await pageRt.goto(`http://127.0.0.1:${PORT}/page11.html`, { waitUntil: "load" });
+await pageRt.bringToFront();
+await sleep(600);
+
+await pageB.evaluate(() => {
+  window.__fxAwake = 0;
+  window.__fxNewTabId = null;
+  const pickEl = (all, label) => {
+    const re = new RegExp("\\[(\\d+)\\][^\\n]*「" + label + "」");
+    const m = re.exec(all);
+    return m ? Number(m[1]) : null;
+  };
+  // ⚠️ 只看"最后一条用户消息"来分支：用整段历史匹配的话，早期出现过的关键词会
+  //    永远抢走后续所有轮次（这次就踩了：后面的 newtab 指令永远走不到）。
+  const lastUser = (req) => {
+    const msgs = (req && req.messages) || [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (!m || m.role !== "user" || m.isActionResult) continue;
+      const c = typeof m.content === "string" ? m.content : "";
+      if (c) return c;
+    }
+    return "";
+  };
+  window.__responder = (req) => {
+    const msgs = (req && req.messages) || [];
+    const all = msgs.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    if (all.includes("这是系统自动唤醒，不是用户输入")) return [{ content: "已继续。" }];
+    const ask = lastUser(req);
+
+    if (ask.includes("填备注")) {
+      const taIdx = pickEl(all, "备注输入框");
+      return [
+        { content: '好。\n```action\n' + JSON.stringify({ action: "fill", target: taIdx, value: "第一行\n第二行" }) + "\n```" },
+      ];
+    }
+    if (ask.includes("多行填写")) {
+      const rtIdx = pickEl(all, "正文编辑器");
+      return [
+        { content: '好。\n```action\n' + JSON.stringify({ action: "fill", target: rtIdx, value: "# 标题一\n## 标题二\n正文内容" }) + "\n```" },
+      ];
+    }
+    if (ask.includes("开个新页")) {
+      // 只开一次：不然每一轮都会再开一个新页（假 AI 的"健忘"是测试自己造成的）
+      if (window.__fxNewtabDone) return [{ content: "新页已经开好了，我去读它。" }];
+      window.__fxNewtabDone = true;
+      return [{ content: '好。\n```action\n' + JSON.stringify({ action: "newtab", url: `http://127.0.0.1:8811/page2.html` }) + "\n```" }];
+    }
+    if (ask.includes("读新页")) {
+      return [{ content: '好。\n```action\n' + JSON.stringify({ action: "extract", tab: window.__fxNewTabId }) + "\n```" }];
+    }
+    if (ask.includes("试关错页")) {
+      return [{ content: "试一下。\n```action\n" + JSON.stringify({ action: "closetab", tab: window.__fxUserTab }) + "\n```" }];
+    }
+    if (ask.includes("关掉新页")) {
+      return [{ content: '好。\n```action\n' + JSON.stringify({ action: "closetab", tab: window.__fxNewTabId }) + "\n```" }];
+    }
+    return [{ content: "好的。" }];
+  };
+  document.getElementById("input").value = "多行填写";
+  document.getElementById("sendBtn").click();
+});
+await sleep(3000);
+
+// —— 换行：富文本与 textarea 都必须保留行 ----------
+const fx = await pageRt.evaluate(() => ({
+  rtLines: window.__fx.rtLines,
+  taLines: window.__fx.taLines,
+  rtText: window.__fx.rtText,
+  taText: window.__fx.taText,
+}));
+check("富文本按行插入（3 行，不是一行）", fx.rtLines === 3, JSON.stringify({ rtLines: fx.rtLines, 文本: fx.rtText.slice(0, 40) }));
+
+// 精确读"这个工作区的会话文本"（不然别的会话里的旧消息会污染断言）
+const wsSessionText = async (tabId) =>
+  pageB.evaluate(async (id) => {
+    const all = await chrome.storage.local.get(null);
+    const keys = Object.keys(all).filter((k) => k.startsWith("ai_workspaces_"));
+    let sessId = null;
+    for (const k of keys) {
+      for (const w of (all[k] || {}).list || []) {
+        if ((w.tabIds || []).includes(id)) sessId = w.sessionId;
+      }
+    }
+    if (!sessId) return "";
+    const s = (all.ai_browser_sessions || []).find((x) => x.id === sessId);
+    return ((s && s.messages) || [])
+      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .join("\n―\n");
+  }, tabId);
+
+// —— textarea 换行（单独发一条，避免和上面的富文本混在一轮里）——
+await pageRt.bringToFront();
+await pageB.evaluate(() => {
+  document.getElementById("input").value = "填备注";
+  document.getElementById("sendBtn").click();
+});
+await sleep(2500);
+const taFx = await pageRt.evaluate(() => ({ taLines: window.__fx.taLines, taText: window.__fx.taText }));
+check("textarea 也保留换行（2 行）", taFx.taLines === 2, JSON.stringify({ taLines: taFx.taLines, 文本: taFx.taText.slice(0, 40) }));
+
+// —— 新开标签页：后台静默 + 并入工作区（数量 +1）+ 用户当前页不变 ——
+const pageRtTabId = await pageB.evaluate(async () => {
+  const [t] = await chrome.tabs.query({ url: "http://127.0.0.1:8811/page11.html" });
+  return t && t.id;
+});
+const tabsBefore = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter((k) => k.startsWith("ai_workspaces_"));
+  const ids = [];
+  for (const k of keys) for (const w of (all[k] || {}).list || []) for (const id of w.tabIds || []) ids.push(id);
+  const [cur] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return { count: ids.length, ids, active: cur && cur.id };
+});
+await pageRt.bringToFront(); // 用户仍在标签页1
+await sleep(300);
+await pageB.evaluate(() => {
+  document.getElementById("input").value = "开个新页";
+  document.getElementById("sendBtn").click();
+});
+await sleep(4000);
+const afterNewTab = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter((k) => k.startsWith("ai_workspaces_"));
+  const ids = [];
+  for (const k of keys) for (const w of (all[k] || {}).list || []) for (const id of w.tabIds || []) ids.push(id);
+  const [cur] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const p2 = await chrome.tabs.query({ url: "http://127.0.0.1:8811/page2.html" });
+  return { count: ids.length, ids, active: cur && cur.id, page2Tabs: p2.map((t) => t.id) };
+});
+check("AI 成功新开了一个标签页", afterNewTab.page2Tabs.length > 0, JSON.stringify(afterNewTab));
+check(
+  "新页已并入本工作区（标签页数 +1）",
+  afterNewTab.count === tabsBefore.count + 1,
+  JSON.stringify({ before: tabsBefore.ids, after: afterNewTab.ids, page2Tabs: afterNewTab.page2Tabs })
+);
+check(
+  "后台静默打开：用户当前页没有被切走",
+  afterNewTab.active === tabsBefore.active,
+  JSON.stringify({ before: tabsBefore.active, after: afterNewTab.active })
+);
+const newTabText = await wsSessionText(pageRtTabId);
+const newTabId = Number((/已新开标签页 id=(\d+)/.exec(newTabText) || [])[1] || 0);
+check(
+  "动作结果里给出了新页 id（AI 后续可用）",
+  newTabId > 0 && afterNewTab.page2Tabs.includes(newTabId),
+  JSON.stringify({
+    newTabId,
+    page2Tabs: afterNewTab.page2Tabs,
+    // 把该工作区里所有"动作执行结果"的首行打出来，看清楚 newtab 那一步到底回了什么
+    results: (newTabText.match(/【动作执行结果】[^\n]*/g) || []).slice(-5),
+    hasNewOpen: /新开/.test(newTabText),
+  })
+);
+
+// —— tab 参数：用户不动，AI 也能读/操作新页；结果回显作用页，不串 ——
+await pageRt.bringToFront();
+await pageB.evaluate((id) => {
+  window.__fxNewTabId = id;
+  document.getElementById("input").value = "读新页";
+  document.getElementById("sendBtn").click();
+}, newTabId);
+await sleep(3200);
+const crossPage = await wsSessionText(pageRtTabId);
+// 只看"读新页"这一次动作的结果（整段历史里还含前面几步的作用页，别混进来）
+const lastResultChunk = crossPage.slice(crossPage.lastIndexOf("【动作执行结果】"));
+const lastActedId = Number((/本步作用在：id=(\d+)/.exec(lastResultChunk) || [])[1] || 0);
+check("动作结果回显「本步作用在：id=…」", lastActedId > 0, JSON.stringify({ lastActedId }));
+check(
+  "带 tab 的动作打在新页上（不是用户眼前那页）",
+  lastActedId === newTabId,
+  JSON.stringify({ newTabId, pageRtTabId, lastActedId })
+);
+check("读到的是新页内容（测试页 2）", /测试页 2/.test(lastResultChunk), lastResultChunk.slice(0, 120));
+
+// —— closetab 只允许关自己开的页 ——
+await pageB.evaluate((uid) => {
+  window.__fxUserTab = uid;
+  document.getElementById("input").value = "试关错页";
+  document.getElementById("sendBtn").click();
+}, pageRtTabId);
+await sleep(2600);
+const guardRes = await pageB.evaluate(async (uid) => {
+  const t = await chrome.tabs.get(uid).catch(() => null);
+  return { stillOpen: !!t };
+}, pageRtTabId);
+const guardText = await wsSessionText(pageRtTabId);
+check(
+  "拒绝关闭用户的页面（只允许关自己开的）",
+  guardRes.stillOpen && /不能关|只能关闭/.test(guardText),
+  JSON.stringify({ stillOpen: guardRes.stillOpen, refused: /不能关|只能关闭/.test(guardText) })
+);
+
+await pageB.evaluate(() => {
+  document.getElementById("input").value = "关掉新页";
+  document.getElementById("sendBtn").click();
+});
+await sleep(2800);
+const closedRes = await pageB.evaluate(async (id) => {
+  const t = await chrome.tabs.get(id).catch(() => null);
+  return { closed: !t };
+}, newTabId);
+check("可以关掉自己开的临时页", closedRes.closed, JSON.stringify(closedRes));
+
+await pageB.evaluate(() => {
+  window.__responder = null;
+});
+await pageRt.close().catch(() => {});
+await sleep(2000); // 等 SW 清理：工作区里的页全关了 → 工作区消失
+
 // ---------- ⑤ 关标签页 → 工作区消失 + 会话删除 ----------
 // 注意：先按"工作区 id"过滤，跟历史里堆积的会话无关
 const sessOfB = st.sessions.filter((s) => s.workspaceId === wsB.id).map((s) => s.id);
 check("工作区 B 有自己的会话", sessOfB.length > 0, "sessions=" + sessOfB.length);
 
-await pageA2.close();
+await pageA2.close().catch(() => {});
 await sleep(1000);
 st = await readState();
 check(

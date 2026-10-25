@@ -305,6 +305,8 @@ export class WorkspaceRuntime {
     this.compressedThisTurn = false;
     // 自动化任务：用户点取消时置 true，循环每轮检查它（这样"取消"才真的能停）
     this.automationCancel = false;
+    // AI 自己用 newtab 开过的标签页（只有这些才允许 closetab 关）
+    this.aiOpenedTabs = new Set();
 
     // 每个工作区自己一份 chat DOM（非激活时脱离文档，但照样能跑）
     this.chatEl = document.createElement("div");
@@ -1334,6 +1336,41 @@ export class WorkspaceRuntime {
   }
 
   // ===== 页面动作（带工作区隔离守卫）=====
+  // ===== 目标标签页解析（多页不串的关键）=====
+  //
+  // 规则（用户要求：AI 自己声明打在哪一页，这样用户切页也不影响它干活）：
+  //   ① 动作里写了 tab → 用它。数值优先当"标签页 id"，落不到 id 就按"工作区列表里的位置编号"；
+  //      也接受标题 / URL 片段。**解析不到就报错**（列出可用 id），绝不悄悄换个页执行。
+  //   ② 没写 tab → 沿用**本轮的粘性目标**（AI 之前声明过的那页；没声明过就是本轮起始页）。
+  //   ③ 粘性目标没了（页被关） → 退回工作区里第一个活着的页。
+  async pickTargetTab(action, fallbackId) {
+    const alive = await this.ctx.getAliveTabs(this);
+    if (!alive.length) return { error: "工作区里的标签页都已关闭" };
+    const listText = alive.map((t, i) => `[${i}] id=${t.id} 「${(t.title || t.url || "未命名").slice(0, 30)}」`).join("  ");
+
+    const want = action && action.tab;
+    if (want !== undefined && want !== null && want !== "" && want !== "current") {
+      const n = Number(want);
+      if (Number.isFinite(n)) {
+        if (alive.some((t) => t.id === n)) return { id: n, how: "id" };
+        if (n >= 0 && n < alive.length) return { id: alive[n].id, how: "序号" };
+      } else {
+        const s = String(want);
+        const hit =
+          alive.find((t) => (t.title || "").includes(s)) ||
+          alive.find((t) => (t.url || "").includes(s));
+        if (hit) return { id: hit.id, how: "标题/网址" };
+      }
+      return {
+        error: `你指定的标签页「${want}」不在本工作区里（或已关闭）。可用的：${listText}`,
+        hint: "请用上面列出的 id（推荐）或位置编号；不要猜。",
+      };
+    }
+
+    if (fallbackId != null && alive.some((t) => t.id === fallbackId)) return { id: fallbackId, how: "沿用" };
+    return { id: alive[0].id, how: "退回第一页" };
+  }
+
   async runPageAction(tabId, action) {
     // 隔离守卫：只能操作本工作区的标签页。这是硬底线，绝不能落到别的工作区或用户自己的页面上。
     if (tabId != null && !this.owns(tabId)) {
@@ -1359,23 +1396,112 @@ export class WorkspaceRuntime {
       }
     }
 
-    if (action && action.action === "switchtab") {
-      const want = Number(action.target);
+    // 多标签页：AI 主动开一个临时页去干活（默认后台静默、不抢用户焦点）
+    // 并入本工作区 → **共用同一份对话**（用户要求）；返回新页 id 供后续 tab 参数引用
+    if (action && action.action === "newtab") {
+      const url = String(action.url || "").trim();
+      if (!/^https?:\/\//i.test(url)) {
+        return { ok: false, msg: "newtab 需要一个 http(s) 网址", hint: '例如 {"action":"newtab","url":"https://example.com"}' };
+      }
+      let winId = null;
+      try {
+        const root = await chrome.tabs.get(this.ws.rootTabId);
+        winId = root && root.windowId != null ? root.windowId : null;
+      } catch (_) {}
+      try {
+        const created = await chrome.tabs.create({
+          url,
+          active: action.active === true, // 默认后台打开：不打断用户正在看的页面
+          windowId: winId != null ? winId : undefined,
+        });
+        if (!created || created.id == null) return { ok: false, msg: "新标签页创建失败" };
+        // 并入本工作区（**共用同一份对话**）→ 写完回读校验一次：
+        // 存储可能被别的上下文（SW 清理 / 另一份面板）按旧快照覆盖，不校验的话
+        // 会出现"页开了但没算进工作区"，后续 tab 参数就用不了（踩过一次）。
+        let joined = false;
+        for (let attempt = 0; attempt < 3 && !joined; attempt++) {
+          this.addTab(created.id);
+          this.aiOpenedTabs.add(created.id);
+          this.ctx.persist();
+          await new Promise((r) => setTimeout(r, 120));
+          try {
+            const back = await this.ctx.getAliveTabs(this);
+            joined = back.some((t) => t.id === created.id);
+          } catch (_) {}
+        }
+        this.ctx.renderWsBar();
+        if (!joined) this.addTab(created.id); // 至少保证内存里有
+        let title = "";
+        try {
+          await waitTabSettle(created.id, 6000);
+          const t = await chrome.tabs.get(created.id);
+          title = (t && t.title) || "";
+        } catch (_) {}
+        return {
+          ok: true,
+          newTabId: created.id,
+          msg:
+            `已新开标签页 id=${created.id}${title ? `「${title.slice(0, 24)}」` : ""}` +
+            `（${action.active === true ? "已切到它" : "后台打开，未打断你当前页面"}，` +
+            (joined ? "已并入本工作区、共用同一份对话" : "**并入未确认**（存储写入可能被覆盖）") +
+            `）`,
+          hint: `接下来每个动作都带上 "tab":${created.id}，就会打在这个新页上`,
+        };
+      } catch (err) {
+        return { ok: false, msg: "新标签页创建失败：" + ((err && err.message) || err) };
+      }
+    }
+
+    // 关掉"AI 自己开的"临时页。**绝不关用户的页面**（这是硬规矩）
+    if (action && action.action === "closetab") {
       const alive = await this.ctx.getAliveTabs(this);
-      if (!alive.length) return { ok: false, msg: "AI 工作区里没有可切换的标签页" };
-      const hit = alive.find((t) => t.id === want);
-      if (!hit) {
-        const names = alive.map((t, i) => `[${i}] ${(t.title || t.url || "未命名").slice(0, 30)}`).join("  ");
+      let wantId = action.tab != null ? Number(action.tab) : tabId;
+      if (action.tab != null && !alive.some((t) => t.id === wantId)) {
+        const n = Number(action.tab);
+        if (Number.isFinite(n) && n >= 0 && n < alive.length) wantId = alive[n].id;
+      }
+      if (!alive.some((t) => t.id === wantId)) {
+        return { ok: false, msg: "要关闭的标签页不在本工作区里（或已关闭）" };
+      }
+      if (!this.aiOpenedTabs.has(wantId)) {
         return {
           ok: false,
-          msg: `标签页 #${want} 不在当前 AI 工作区内，不能切换过去`,
-          hint: `你只能切换到本工作区内的标签页：${names}`,
+          msg: "只能关闭你自己用 newtab 打开的临时页；这一页是用户的页面，不能关",
+          hint: "如果确实要关用户的页，请先问user确认；否则别动它。",
         };
       }
+      if (this.ws.tabIds.length <= 1) {
+        return { ok: false, msg: "这是工作区里最后一个标签页了，不能关（关了工作区就没了）" };
+      }
+      try {
+        const t = await chrome.tabs.get(wantId).catch(() => null);
+        await chrome.tabs.remove(wantId);
+        this.aiOpenedTabs.delete(wantId);
+        this.removeTab(wantId);
+        if (this.ws.rootTabId === wantId && this.ws.tabIds.length) this.ws.rootTabId = this.ws.tabIds[0];
+        this.ctx.persist();
+        this.ctx.renderWsBar();
+        return { ok: true, msg: `已关闭临时标签页 id=${wantId}${t && t.title ? `「${t.title.slice(0, 24)}」` : ""}` };
+      } catch (err) {
+        return { ok: false, msg: "关闭标签页失败：" + ((err && err.message) || err) };
+      }
+    }
+
+    if (action && action.action === "switchtab") {
+      // 支持两种写法：真实 tabId（推荐、稳定），或工作区列表里的位置编号
+      const picked = await this.pickTargetTab({ tab: action.target ?? action.tab }, null);
+      if (picked.error) {
+        return { ok: false, msg: picked.error, hint: picked.hint };
+      }
+      const hit = (await this.ctx.getAliveTabs(this)).find((t) => t.id === picked.id);
       try {
         await chrome.tabs.update(hit.id, { active: true });
         await chrome.windows.update(hit.windowId, { focused: true }).catch(() => {});
-        return { ok: true, msg: `已切换到标签页「${(hit.title || hit.url || "未命名").slice(0, 30)}」` };
+        return {
+          ok: true,
+          switchedTo: hit.id,
+          msg: `已切换到标签页 id=${hit.id}「${(hit.title || hit.url || "未命名").slice(0, 30)}」（切换的是用户视图）`,
+        };
       } catch (err) {
         return { ok: false, msg: "切换标签页失败：" + (err.message || err) };
       }
@@ -2111,12 +2237,40 @@ export class WorkspaceRuntime {
         }
 
         this.setStatus("正在执行操作…", "busy");
+
+        // —— 目标页解析（多页不串的关键）——
+        // 动作里写了 tab 就用它；没写就沿用本轮粘性目标；解析不到直接报错，不偷偷换页执行。
+        const picked = await this.pickTargetTab(action, tabId);
+        if (picked.error) {
+          const badCard = card;
+          badCard.setState("failed", "目标页无效");
+          const badMsg =
+            `【动作执行结果】未执行：${picked.error}` + (picked.hint ? `\n建议：${picked.hint}` : "");
+          this.session.messages.push({ role: "assistant", content: acc, finalText, steps: [stepRec] });
+          this.session.messages.push({ role: "user", content: badMsg, isActionResult: true });
+          snapshot = await getPageSnapshot(tabId);
+          this.targetPageLabel = (snapshot?.title || targetTab?.title || "").slice(0, 42);
+          await this.ctx.saveSession(this.session);
+          continue;
+        }
+        if (picked.id !== tabId) {
+          tabId = picked.id; // 粘性：后续动作/观察默认都跟着这一页
+          try {
+            targetTab = await chrome.tabs.get(tabId);
+          } catch (_) {
+            targetTab = null;
+          }
+        }
+
         await setBanner(tabId, true);
         // 记下动作时刻：之后只有"这之后"新开的子标签页才算"上一步开了新页"
         lastActionAt = Date.now();
         // 同时记到运行时上（侧栏判断"这个新页是不是 AI 弹出来的"要用它）
         this.lastActionAt = lastActionAt;
         const result = await this.runPageAction(tabId, action);
+        // switchtab / newtab 改变了目标页 → 后续默认跟着走
+        if (result.switchedTo != null) tabId = result.switchedTo;
+        if (result.newTabId != null) tabId = result.newTabId;
 
         const storedResult = { ...result };
         delete storedResult.screenshot;
@@ -2173,6 +2327,14 @@ export class WorkspaceRuntime {
         this.targetPageLabel = (snapshot?.title || targetTab?.title || "").slice(0, 42);
 
         let resultMsg = `【动作执行结果】${result.ok ? "成功" : "失败"}：${result.msg || ""}`;
+        // 回显"这一步作用在哪一页"（多页时用户和 AI 都能一眼核对，防止串页）
+        try {
+          const acted = await chrome.tabs.get(tabId);
+          const ttl = (acted && acted.title) || (acted && acted.url) || "未命名";
+          resultMsg += `\n本步作用在：id=${tabId}「${String(ttl).slice(0, 30)}」`;
+        } catch (_) {
+          resultMsg += `\n本步作用在：id=${tabId}（该页已关闭或不可读）`;
+        }
         if (result.hint) resultMsg += `\n建议：${result.hint}`;
         if (result.navigated) {
           resultMsg += `\n页面已跳转，当前 URL：${result.url || "(未知)"}。这是本次动作已经生效的信号，不要再重复执行同一个动作。`;
@@ -2198,11 +2360,15 @@ export class WorkspaceRuntime {
         if (scopeList.length > 1) {
           const rows = scopeList
             .map((t, i) => {
-              const cur = t.id === tabId ? " ←当前" : "";
-              return `  [${i}] ${(t.title || t.url || "未命名").slice(0, 36)}${cur}`;
+              const cur = t.id === tabId ? " ←当前目标" : "";
+              const mine = this.aiOpenedTabs && this.aiOpenedTabs.has(t.id) ? "（我自己开的）" : "";
+              return `  [${i}] id=${t.id} 「${(t.title || t.url || "未命名").slice(0, 36)}」${mine}${cur}`;
             })
             .join("\n");
-          resultMsg += `\n【AI 工作区的标签页】你只能操作下面这些标签页（switchtab 切换）：\n${rows}`;
+          resultMsg +=
+            `\n【AI 工作区的标签页】你只能操作下面这些标签页。**要用 id 指定**：在动作里加 "tab":<id>：\n${rows}` +
+            `\n（不写 tab 时：沿用你本轮最近指定的那一页；a11y / find / extract / 点击填写都支持 tab。` +
+            `要另开一页去浏览用 {"action":"newtab","url":"…"}；用完自己开的临时页可 {"action":"closetab","tab":<id>}。）`;
         }
 
         if (snapshot && snapshot.elements?.length) {
