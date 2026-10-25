@@ -30,7 +30,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------- 本地测试页 ----------
 const server = http.createServer((req, res) => {
   const name = path.basename(String(req.url || "").split("?")[0].split("#")[0]);
-  const allowed = new Set(["page1.html", "page2.html", "page9.html"]);
+  const allowed = new Set(["page1.html", "page2.html", "page9.html", "page10.html"]);
   if (!allowed.has(name)) {
     res.writeHead(404);
     res.end("nf");
@@ -1017,34 +1017,80 @@ check(
   JSON.stringify(floaters)
 );
 
-// ---------- ㉑ 自动化任务：重复性动作交给程序跑循环，跑完唤醒 AI ----------
-// 用户要求：像"点一下等两秒循环 3 次""PPT 一页页翻到底"这种重复动作，
-// 让程序去跑循环，AI 先休息；跑完唤醒 AI，先检查再继续。
+// ---------- ㉑ 自动化任务（新设计）：编号定位 + 干扰项 + 就绪等待 + 计数 + 可取消 ----------
+// 用户要求 / 验收标准：
+//   ① 页头页脚各有一个同名假「下一页」→ 必须点中**中间那个真按钮**（靠 AI 给的编号 + 定位器）
+//   ② 点击后 1.5 秒才渲染完 → 每步用 waitFor 等就绪，不误判失败
+//   ③ 页码 1、2、3… 用 inc 递增，并用 {page} 模板确认"真的翻到下一页了"
+//   ④ 跑完唤醒 AI 一次；点「取消」要真的停
 const pageAuto = await browser.newPage();
-await pageAuto.goto(`http://127.0.0.1:${PORT}/page9.html`, { waitUntil: "load" });
+await pageAuto.goto(`http://127.0.0.1:${PORT}/page10.html`, { waitUntil: "load" });
 await pageAuto.bringToFront();
 await sleep(600);
 
-// 让这个页面成为一份新工作区（发一条消息）
+// 让这个页面成为一份新工作区；responder 扮演"会挑编号的 AI"：
+// 从元素列表里挑出**附近文字**指向真正分页区的那个「下一页」（中间那个），拿它的编号写进 automate
 await pageB.evaluate(() => {
   window.__autoWake = 0;
   window.__autoReq = "";
+  window.__autoPicked = null;
   window.__responder = (req) => {
     const all = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
-    // 被自动化任务唤醒后：先检查现状，再给出结论
     if (all.includes("这是系统自动唤醒，不是用户输入")) {
       window.__autoWake = (window.__autoWake || 0) + 1;
-      window.__autoReq = all.slice(-600);
-      return [{ content: "唤醒后已检查页面，继续完成任务。" }];
+      window.__autoReq = all.slice(-700);
+      return [{ content: "唤醒后已读页面确认现状，继续完成任务。" }];
     }
     if (all.includes("把这些页面翻完")) {
+      // 扮演"会挑编号的 AI"：从元素列表里挑出**同名第 2 个 / 页面中部**的那个真按钮
+      // （元素列表现在会给出「同名 2/3 · 页面中部 · 附近「…」」这类提示）
+      const re = /\[(\d+)\]\s*button[^\n]*?「下一页」([^\n]*)/g;
+      let m;
+      const all2 = [];
+      while ((m = re.exec(all))) {
+        const tail = m[2] || "";
+        all2.push({
+          idx: Number(m[1]),
+          same: (/同名\s*(\d+)\/(\d+)/.exec(tail) || [])[0] || "",
+          nth: Number((/同名\s*(\d+)\//.exec(tail) || [])[1] || 0),
+          mid: /页面中部/.test(tail),
+          decoy: /干扰/.test(tail),
+          tail: tail.trim(),
+        });
+      }
+      // 优先：位置在页面中部、且附近文字不含"干扰"；其次：同名 2/3；最后：三个里取中间那个
+      const picked =
+        all2.find((x) => x.mid && !x.decoy) ||
+        all2.find((x) => x.nth === 2) ||
+        all2.find((x) => !x.decoy) ||
+        all2[1] ||
+        all2[0] ||
+        null;
+      window.__autoPicked = picked;
+      window.__autoAll = all2;
+      const idx = picked ? picked.idx : 0;
       return [
         {
           content:
-            '交给自动化任务。\n```action\n{"action":"automate","name":"翻完所有页面","repeat":20,' +
-            '"intervalMs":400,"steps":[{"op":"click","text":"下一页"},{"op":"wait","ms":300}],' +
-            '"until":{"op":"disabled","text":"下一页"},"maxMs":30000,' +
-            '"instruction":"翻完后检查现在在第几页，并汇报一共翻了几页"}\n```',
+            "交给自动化任务。\n```action\n" +
+            JSON.stringify({
+              action: "automate",
+              name: "翻到最后一页",
+              repeat: 20,
+              intervalMs: 150,
+              vars: { page: 1 },
+              steps: [
+                { op: "click", target: idx },
+                { op: "inc", var: "page" },
+                // 等"下一页"重新可点（真实站点点击后常短暂禁用）；到最后一页会等超时→轮末判到头
+                { op: "waitFor", target: idx, state: "enabled", ms: 6000 },
+              ],
+              until: { op: "disabled", target: idx },
+              stallLimit: 3,
+              maxMs: 60000,
+              instruction: "翻完后读页面，汇报一共几页",
+            }) +
+            "\n```",
         },
       ];
     }
@@ -1053,61 +1099,114 @@ await pageB.evaluate(() => {
   document.getElementById("input").value = "把这些页面翻完";
   document.getElementById("sendBtn").click();
 });
-await sleep(1200);
+await sleep(1400);
 
-// 自动化任务应当已经在跑：横条显示"自动化任务…"
 const autoChip = await pageB.evaluate(() => {
   const chip = document.getElementById("deferChip");
-  const host = document.getElementById("chatHost");
   return {
     visible: !!chip && getComputedStyle(chip).display !== "none",
     text: (document.getElementById("deferChipText") || {}).textContent || "",
-    chat: (host ? host.innerText : "").slice(-420),
+    picked: window.__autoPicked,
   };
 });
-check("自动化任务开始时侧栏显示「运行中」横条", autoChip.visible && /自动化任务/.test(autoChip.text), JSON.stringify(autoChip));
+check("AI 从元素列表里挑出了真按钮（附近文字指向分页区）", !!autoChip.picked, JSON.stringify({ picked: autoChip.picked }));
+check("自动化任务开始时侧栏显示「运行中」横条", autoChip.visible && /自动化任务/.test(autoChip.text), JSON.stringify({ visible: autoChip.visible, text: autoChip.text }));
 
-// 等程序跑完循环（点 4 次翻到第 5 页 → 下一页禁用 → 停）
-let autoPage = 0;
-for (let i = 0; i < 40; i++) {
-  autoPage = await pageAuto.evaluate(() => (window.__fixture ? window.__fixture.page : 0));
-  if (autoPage >= 5) break;
-  await sleep(300);
+// 等它翻完（慢更新 1.5 秒 × 3 次）
+let autoState = null;
+for (let i = 0; i < 60; i++) {
+  autoState = await pageAuto.evaluate(() => ({
+    page: window.__fixture2.page,
+    clicks: window.__fixture2.clicks,
+    decoy: window.__fixture2.decoyClicks,
+    busy: window.__fixture2.busy,
+  }));
+  if (autoState.page >= 4) break;
+  await sleep(400);
 }
-const autoClicks = await pageAuto.evaluate(() => (window.__fixture ? window.__fixture.clicks : 0));
-const autoLog = await pageB.evaluate(async () => {
-  const all = await chrome.storage.local.get(null);
-  const sessions = all.ai_browser_sessions || [];
-  let best = "";
-  for (const s of sessions) {
-    for (const m of s.messages || []) {
-      const c = typeof m.content === "string" ? m.content : "";
-      if (c.includes("自动化任务") && c.length > best.length) best = c;
-    }
-  }
-  return best.slice(0, 700);
-});
-check(
-  "程序真的在页面里跑了循环（翻到了最后一页）",
-  autoPage >= 5 && autoClicks >= 4,
-  JSON.stringify({ autoPage, autoClicks, log: autoLog.slice(-260) })
-);
+check("**点的是真按钮，不是页头/页脚的假按钮**", autoState && autoState.decoy === 0, JSON.stringify({ decoyClicks: autoState && autoState.decoy }));
 
-// 跑完 → 应当唤醒 AI（侧栏横条消失、并把"跑了多少轮"写进唤醒消息）
+// 等"跑完并唤醒"（横条收起 + AI 收到结果）——结果消息这时才写完，不能提前读
 let woke = null;
-for (let i = 0; i < 40; i++) {
+for (let i = 0; i < 50; i++) {
   woke = await pageB.evaluate(() => ({ n: window.__autoWake || 0, chipHidden: document.getElementById("deferChip").classList.contains("hidden") }));
   if (woke.n > 0) break;
   await sleep(400);
 }
-check("跑完自动唤醒 AI 继续（只唤醒一次）", woke.n === 1, JSON.stringify(woke));
-const wakeText = await pageB.evaluate(() => window.__autoReq || "");
+await sleep(600); // 让结果消息落盘
+
+const autoLog = await pageB.evaluate(async () => {
+  const all = await chrome.storage.local.get(null);
+  const sessions = all.ai_browser_sessions || [];
+  let best = "";
+  // 要的是"程序跑完的结果"那条（【自动化任务结果】），不是模型自己写的那段动作 JSON
+  for (const s of sessions) {
+    for (const m of s.messages || []) {
+      const c = typeof m.content === "string" ? m.content : "";
+      if (c.includes("【自动化任务结果】") && c.length > best.length) best = c;
+    }
+  }
+  return best.slice(0, 1400);
+});
+console.log("[auto] 挑中的编号：" + JSON.stringify((await pageB.evaluate(() => window.__autoPicked)) || null));
 check(
-  "唤醒消息里带上了「跑了几轮/为何停」，便于 AI 先检查",
-  /跑了\s*\d+\s*轮/.test(wakeText) || /停止原因/.test(wakeText),
-  wakeText.slice(wakeText.indexOf("自动化任务"), wakeText.indexOf("自动化任务") + 90)
+  "慢更新下靠「等按钮重新可点」跨过加载态（前几轮都等到了，且干净收尾）",
+  /停止原因 until:disabled/.test(autoLog) &&
+    !/停止原因 error/.test(autoLog) &&
+    (autoLog.match(/✓ 等到目标enabled/g) || []).length >= 2,
+  autoLog.slice(0, 460)
 );
+check("变量按轮递增（翻到第 4 页）", /"page":\s*4/.test(autoLog), (autoLog.match(/"page":\s*\d+/) || [])[0] || "（日志里没看到变量）");
+
+check("跑完自动唤醒 AI 继续（只唤醒一次）", woke.n === 1, JSON.stringify(woke));
 check("唤醒后横条收起", woke.chipHidden, JSON.stringify(woke));
+
+// —— 取消：必须真的停下来（老 bug 是"点了取消，循环照跑"）——
+const beforeCancel = await pageAuto.evaluate(() => window.__fixture2.page);
+await pageB.evaluate(() => {
+  // 回到第 1 页，准备一次长任务
+  window.__responder = (req) => {
+    const all = (req?.messages || []).map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    if (all.includes("慢慢翻")) {
+      const re = /\[(\d+)\]\s*button\S*\s*「下一页」(?:（附近：「([^」]*)」）)?/g;
+      let m;
+      const all2 = [];
+      while ((m = re.exec(all))) all2.push({ idx: Number(m[1]), near: m[2] || "" });
+      const picked = all2.find((x) => /第\s*\d+\s*页/.test(x.near)) || all2[0];
+      return [
+        {
+          content:
+            "好。\n```action\n" +
+            JSON.stringify({
+              action: "automate",
+              name: "慢慢翻",
+              repeat: 20,
+              intervalMs: 1500,
+              steps: [{ op: "click", target: picked.idx }, { op: "wait", ms: 1600 }],
+              maxMs: 120000,
+              instruction: "继续",
+            }) +
+            "\n```",
+        },
+      ];
+    }
+    return [{ content: "好的。" }];
+  };
+  document.getElementById("input").value = "慢慢翻";
+  document.getElementById("sendBtn").click();
+});
+await sleep(1500);
+const cancelBefore = await pageAuto.evaluate(() => window.__fixture2.clicks);
+await pageB.evaluate(() => document.getElementById("deferCancelBtn").click());
+await sleep(1200);
+const cancelMid = await pageAuto.evaluate(() => window.__fixture2.clicks);
+await sleep(3500);
+const cancelAfter = await pageAuto.evaluate(() => window.__fixture2.clicks);
+check(
+  "点「取消」后循环真的停下（不再继续点）",
+  cancelAfter - cancelMid <= 1,
+  JSON.stringify({ before: cancelBefore, mid: cancelMid, after: cancelAfter, pageBeforeCancel: beforeCancel })
+);
 
 await pageB.evaluate(() => {
   window.__responder = null;

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>自动化任务夹具 · 干扰项与慢更新</title>
+  <style>
+    body { font-family: "Microsoft YaHei", sans-serif; padding: 24px; max-width: 760px; }
+    h1 { font-size: 18px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin: 12px 0; }
+    .bar { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+    button { padding: 8px 14px; border-radius: 8px; border: 1px solid #bbb; background: #f7f7f7; cursor: pointer; font: inherit; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    .pagebody { min-height: 120px; }
+    .loading { color: #b45309; }
+    /* 页头的"假下一页"：文字一模一样，但在 DOM 里排在真按钮前面 */
+    .decoy { border: 1px dashed #f59e0b; background: #fffbeb; }
+  </style>
+</head>
+<body>
+  <!-- 干扰项：同样写着"下一页"，点了什么都不做 -->
+  <div class="card decoy">
+    <div>页头导航（干扰项）</div>
+    <button id="decoyBtn">下一页</button>
+  </div>
+
+  <h1>真正的分页区</h1>
+  <div class="card">
+    <div id="pageInfo">第 1 页 / 共 4 页</div>
+    <div id="pageBody" class="pagebody">这是第 1 页的内容。</div>
+    <div class="bar">
+      <button id="prevBtn">上一页</button>
+      <button id="nextBtn">下一页</button>
+      <span id="clicks">点击次数：0</span>
+    </div>
+  </div>
+
+  <!-- 页脚又一份同名干扰 -->
+  <div class="card decoy">
+    <div>页脚导航（干扰项）</div>
+    <button id="decoyBtn2">下一页</button>
+  </div>
+
+  <script>
+    var totalPages = 4;
+    var page = 1;
+    var clicks = 0;
+    var busy = false;
+
+    // 真按钮：点击后 1.5 秒内容才更新（模拟真实站点的异步渲染）
+    function realNext() {
+      if (busy || page >= totalPages) return;
+      busy = true;
+      clicks++;
+      document.getElementById("pageBody").innerHTML =
+        '<span class="loading">正在加载第 ' + (page + 1) + ' 页…</span>';
+      document.getElementById("nextBtn").disabled = true;
+      document.getElementById("clicks").textContent = "点击次数：" + clicks;
+      setTimeout(function () {
+        busy = false;                    // 先解除"忙"，再重绘（否则按钮会一直禁用）
+        if (page < totalPages) page++;
+        render();
+      }, 1500);
+    }
+    function render() {
+      var info = document.getElementById("pageInfo");
+      var body = document.getElementById("pageBody");
+      if (!busy) {
+        info.textContent = "第 " + page + " 页 / 共 " + totalPages + " 页";
+        body.textContent = "这是第 " + page + " 页的内容。";
+      }
+      document.getElementById("prevBtn").disabled = page <= 1 || busy;
+      document.getElementById("nextBtn").disabled = page >= totalPages || busy;
+    }
+    document.getElementById("nextBtn").addEventListener("click", realNext);
+    document.getElementById("prevBtn").addEventListener("click", function () {
+      if (busy || page <= 1) return;
+      clicks++;
+      page--;
+      render();
+    });
+    // 干扰按钮：什么都不做，但记下被点了几次（用来断言"没点错"）
+    var decoyClicks = 0;
+    document.getElementById("decoyBtn").addEventListener("click", function () { decoyClicks++; });
+    document.getElementById("decoyBtn2").addEventListener("click", function () { decoyClicks++; });
+
+    render();
+    window.__fixture2 = {
+      get page() { return page; },
+      get clicks() { return clicks; },
+      get busy() { return busy; },
+      get decoyClicks() { return decoyClicks; },
+      get totalPages() { return totalPages; },
+    };
+  </script>
+</body>
+</html>

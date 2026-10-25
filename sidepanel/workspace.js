@@ -25,6 +25,12 @@ const MAX_STUCK_FAILS = 6;
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 截短显示用（自动化日志里到处要用）
+const clip = (s, n) => {
+  const t = String(s == null ? "" : s).trim();
+  return t.length > n ? t.slice(0, n) + "…" : t;
+};
+
 // 可被"停止"打断的等待：用户点停止后要立刻结束，不能干等完 9 秒
 function sleepAbortable(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -297,6 +303,8 @@ export class WorkspaceRuntime {
     // 记忆压缩状态（compressing 防重入；compressedThisTurn 保证一轮只压一次）
     this.compressing = false;
     this.compressedThisTurn = false;
+    // 自动化任务：用户点取消时置 true，循环每轮检查它（这样"取消"才真的能停）
+    this.automationCancel = false;
 
     // 每个工作区自己一份 chat DOM（非激活时脱离文档，但照样能跑）
     this.chatEl = document.createElement("div");
@@ -697,6 +705,8 @@ export class WorkspaceRuntime {
   // ===== 后台任务提示条 =====
   deferLabel(task) {
     if (!task || !task.until) return "等待条件满足";
+    // 自动化任务：用运行中动态生成的 label（带"第几轮 / 页码"），没有就用默认文案
+    if (task.label) return task.label;
     const u = task.until;
     if (u.type === "automation") return `自动化任务：${u.name || "未命名"}（程序在跑，跑完叫我）`;
     return u.type === "video-ended"
@@ -721,6 +731,10 @@ export class WorkspaceRuntime {
 
   async cancelActiveDefer() {
     const id = this.activeDeferTask && this.activeDeferTask.id;
+    const isAuto = !!(this.activeDeferTask && this.activeDeferTask.until && this.activeDeferTask.until.type === "automation");
+    // 自动化任务：先置取消标志 —— 循环每轮都会检查它，**真的会停下来**
+    //（以前点取消只删了后台任务，页面里的循环照跑，这是个真 bug）
+    if (isAuto) this.automationCancel = true;
     if (!id) return;
     const task = this.activeDeferTask;
     this.activeDeferTask = null;
@@ -728,8 +742,569 @@ export class WorkspaceRuntime {
     try {
       await chrome.runtime.sendMessage({ type: "defer:cancel", taskId: id });
     } catch (_) {}
-    this.addNoteBubble("已取消后台任务：" + ((task.instruction || "").slice(0, 40) || "等待条件满足"));
-    this.setStatus("已取消后台任务", "");
+    this.addNoteBubble(isAuto ? "已请求停止自动化任务，当前这一步做完就停" : "已取消后台任务：" + ((task.instruction || "").slice(0, 40) || "等待条件满足"));
+    this.setStatus(isAuto ? "已请求停止自动化任务" : "已取消后台任务", "");
+  }
+
+  // ===== 自动化任务：循环在**侧栏**这一侧跑 =====
+  //
+  // 为什么不塞进页面里（老做法的毛病）：
+  //   · 每步不会等页面就绪 → 撞上加载态就"点了没反应"
+  //   · 中间不重新观察、不验证 → 跑完才知道成没成
+  //   · 取消按钮停不掉它；页面一导航就断；进度看不见
+  //
+  // 现在的逻辑（每一轮）：
+  //   ① 就绪等待：可选 waitFor（"等出现『第 3 页』"），超时才继续
+  //   ② 逐步执行：每步先**用定位器找回元素**（同号 → 路径 → 文字就近 → 失败就停），
+  //      再交给 act 执行（与 AI 手动点是同一套）
+  //   ③ 轻量验证：比页面有没有推进（不拍快照，避免重编号）
+  //   ④ 变量：inc/dec/set + 文本里的 {变量} 模板（页码 1、2、3… 靠这个）
+  //   ⑤ guard 清弹窗 / stopIf 被拦就停 / 进度上报 / 检查取消标志
+  async startAutomation(tabId, action) {
+    const steps = Array.isArray(action.steps) ? action.steps.filter((x) => x && typeof x === "object") : [];
+    if (!steps.length) {
+      return {
+        ok: false,
+        msg: "automate 需要 steps（要循环做什么）",
+        hint:
+          '{"action":"automate","name":"翻到最后一页","repeat":20,' +
+          '"steps":[{"op":"click","target":42},{"op":"waitFor","text":"第 {page} 页","ms":8000},{"op":"inc","var":"page"}],' +
+          '"vars":{"page":1},"until":{"op":"disabled","target":42},"instruction":"翻完后汇报一共几页"}',
+      };
+    }
+    const instruction = String(action.instruction || "").trim();
+    if (!instruction) {
+      return {
+        ok: false,
+        msg: "automate 需要 instruction（跑完唤醒后要做什么）",
+        hint: "比如：跑完后检查现在在第几页，并总结翻过的内容",
+      };
+    }
+
+    const name = String(action.name || "自动化任务").slice(0, 30);
+    const repeat = Math.max(1, Math.min(500, Number(action.repeat) > 0 ? Math.round(Number(action.repeat)) : 1));
+    const maxMs = Math.max(1000, Math.min(600000, Number(action.maxMs) > 0 ? Number(action.maxMs) : 180000));
+    const intervalMs = Math.max(0, Math.min(20000, Number(action.intervalMs) >= 0 ? Number(action.intervalMs) : 250));
+    const stallLimit = Math.max(1, Math.min(20, Number(action.stallLimit) > 0 ? Number(action.stallLimit) : 3));
+    const retry = {
+      times: Math.max(0, Math.min(5, Number(action.retry && action.retry.times) || 1)),
+      intervalMs: Math.max(200, Math.min(10000, Number(action.retry && action.retry.intervalMs) || 1200)),
+    };
+    const until = action.until && typeof action.until === "object" ? action.until : null;
+    const guard = Array.isArray(action.guard) ? action.guard.filter((g) => g && (g.text || g.target != null)) : [];
+    const stopIf = Array.isArray(action.stopIf) ? action.stopIf.filter((g) => g && (g.text || g.target != null)) : [];
+    // 变量：{page} 这类模板用它；页码自增就靠 inc
+    const vars = {};
+    for (const [k, v] of Object.entries(action.vars && typeof action.vars === "object" ? action.vars : {})) {
+      vars[k] = Number.isFinite(Number(v)) ? Number(v) : v;
+    }
+
+    const taskId = "auto_" + Math.random().toString(36).slice(2, 10);
+    let timeoutSec = Math.ceil(maxMs / 1000) + 30;
+    try {
+      let winId = null;
+      try {
+        const t = await chrome.tabs.get(tabId);
+        winId = t && t.windowId != null ? t.windowId : null;
+      } catch (_) {}
+      const resp = await chrome.runtime.sendMessage({
+        type: "defer:register",
+        task: {
+          id: taskId,
+          instruction,
+          until: { type: "automation", name, repeat, steps: steps.length },
+          tabId,
+          windowId: winId,
+          workspaceId: this.ws.id,
+          timeoutSec,
+          label: `自动化任务：${name}`,
+        },
+      });
+      if (resp && resp.timeoutSec) timeoutSec = resp.timeoutSec;
+    } catch (err) {
+      return { ok: false, msg: "自动化任务注册失败：" + (err.message || err) };
+    }
+
+    this.automationCancel = false;
+    this.activeDeferTask = {
+      id: taskId,
+      until: { type: "automation", name },
+      label: `自动化任务：${name}`,
+      instruction,
+    };
+    this.ctx.onDeferChange(this);
+    this.setStatus(`自动化任务「${name}」第 0/${repeat} 轮`, "busy");
+
+    // 后台跑（不阻塞这一轮结束）：AI 先"休息"，跑完再唤醒它
+    this.runAutomationLoop({ tabId, taskId, name, instruction, repeat, intervalMs, maxMs, stallLimit, retry, until, guard, stopIf, vars, steps })
+      .then((result) => this.finishAutomation(result))
+      .catch((err) => this.finishAutomation({ ok: false, name, stoppedBy: "error", detail: String((err && err.message) || err) }));
+
+    return {
+      ok: true,
+      deferred: true,
+      taskId,
+      automation: true,
+      msg: `已开始自动化任务「${name}」（最多 ${repeat} 轮，循环在侧栏这侧跑，可随时点横条取消）`,
+    };
+  }
+
+  // 文本模板：把 {page} 这类占位换成变量值
+  _tpl(text, vars) {
+    return String(text == null ? "" : text).replace(/\{(\w+)\}/g, (m, k) => (vars[k] === undefined ? m : String(vars[k])));
+  }
+
+  // 页面探针（不碰编号表）：拿当前文字/页码/滚动状态
+  async _probe(tabId) {
+    try {
+      await injectScript(tabId, "content/control.js");
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const p = globalThis.__aiCtl.probePage();
+          return { url: p.url, title: p.title, textLen: p.textLen, marks: p.marks, scrollY: p.scrollY, scrollHeight: p.scrollHeight, sample: p.sample };
+        },
+      });
+      return result || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // 页面里有没有这段文字（不碰编号表）
+  async _hasText(tabId, text) {
+    if (!text) return false;
+    try {
+      await injectScript(tabId, "content/control.js");
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (q) => globalThis.__aiCtl.hasText(q),
+        args: [String(text)],
+      });
+      return !!result;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // 把"编号/文字"变成定位器（开工时做一次），后续每轮用它找回元素
+  async _makeLocator(tabId, step, vars) {
+    const want = step.target != null && step.target !== "" ? Number(step.target) : null;
+    const text = step.text || step.label || "";
+    try {
+      await injectScript(tabId, "content/control.js");
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (idx, txt) => {
+          const ctl = globalThis.__aiCtl;
+          if (idx != null && Number.isFinite(idx)) {
+            const loc = ctl.makeLocator(idx);
+            if (loc) {
+              if (txt && !loc.text) loc.text = String(txt);
+              return loc;
+            }
+          }
+          // 没有编号（或编号已失效）→ 只用文字当定位器
+          return txt ? { index: null, text: String(txt), role: "", aria: "", id: "", name: "", path: "", near: [], rect: null } : null;
+        },
+        args: [want, text],
+      });
+      return result || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // 等页面"稳定下来"：连续两次探针一致就认为不忙了（最多等 ms）
+  // 为什么需要：点击后页面常有一段"忙"的窗口（按钮短暂变灰、内容还在渲染），
+  // 这时候去判 until、或立刻执行下一步都会误判。先等稳定就能自动跨过这个窗口。
+  async _settle(tabId, ms = 3000) {
+    const t0 = Date.now();
+    let prev = await this._probe(tabId);
+    while (Date.now() - t0 < ms) {
+      await sleepMs(300);
+      const now = await this._probe(tabId);
+      if (
+        prev &&
+        now &&
+        prev.url === now.url &&
+        prev.marks === now.marks &&
+        prev.textLen === now.textLen &&
+        prev.scrollY === now.scrollY
+      ) {
+        return now;
+      }
+      prev = now;
+    }
+    return prev;
+  }
+
+  // 每轮逐步执行；返回 { ok, log, matched }
+  async _runSteps(tabId, steps, vars, opts) {
+    const log = [];
+    let allOk = true;
+    let failed = false; // 本轮已有步骤失败 → 后面的"等就绪"不用等了（等的东西不会来）
+    let actionFailed = false; // 本轮"真动作"（click/fill/…）有没有失败
+    const pendingVars = []; // 变量改动先攒着，等本轮动作成功了再落地
+    const retry = opts.retry || { times: 1, intervalMs: 1200 };
+    for (const rawStep of steps) {
+      if (this.automationCancel) return { ok: false, log, cancelled: true };
+      const step = { ...rawStep };
+      if (step.text) step.text = this._tpl(step.text, vars);
+      const op = String(step.op || step.type || "click").toLowerCase();
+
+      // —— 变量操作（增加/减少/赋值）：页码 1、2、3… 靠它 ——
+      // 注意：**先攒着，等本轮动作成功后再生效**。
+      // 否则会出现"点击失败（已在最后一页）但页码还加了 1"这种脏数据，
+      // AI 拿到错误页码就会向用户汇报错的进度。
+      if (op === "inc" || op === "dec" || op === "add" || op === "sub") {
+        const key = String(step.var || step.name || "n");
+        const by = Number(step.by != null ? step.by : step.value != null ? step.value : 1) || 1;
+        const cur = Number(vars[key]);
+        const base = Number.isFinite(cur) ? cur : 0;
+        pendingVars.push({ key, value: op === "inc" || op === "add" ? base + by : base - by });
+        continue;
+      }
+      if (op === "set") {
+        const key = String(step.var || step.name || "n");
+        pendingVars.push({ key, value: Number.isFinite(Number(step.value)) ? Number(step.value) : step.value });
+        continue;
+      }
+
+      // —— 等待 ——
+      if (op === "wait" || op === "sleep") {
+        const ms = Number(step.ms) > 0 ? Number(step.ms) : Number(step.seconds) > 0 ? Number(step.seconds) * 1000 : 500;
+        await sleepMs(ms);
+        log.push(`✓ 等待 ${ms}ms`);
+        continue;
+      }
+      // 等"就绪条件"（而不是死等毫秒）：等出现某段文字，超时才继续。
+      // 本轮之前已有步骤失败 → 直接跳过（等的东西不会来了，别白等）
+      if (op === "waitfor" || op === "wait-for" || op === "waituntil") {
+        if (failed) {
+          log.push(`· 跳过等待「${clip(step.text || "", 20)}」（前面这步没成）`);
+          continue;
+        }
+        const timeout = Math.max(500, Math.min(30000, Number(step.ms) > 0 ? Number(step.ms) : 5000));
+        // 等什么：默认有 text 就等文字，给了 target+state 就等"这个元素的状态"
+        // （state: enabled / disabled / present / absent —— "等按钮重新可点"是真实站点最可靠的"就绪信号"：
+        //   点击后按钮常会短暂变灰防重复提交，恢复即代表这一页处理完了）
+        const wantState = String(step.state || (step.text ? "text" : "enabled")).toLowerCase();
+        const t0 = Date.now();
+        let seen = false;
+        while (Date.now() - t0 < timeout) {
+          if (this.automationCancel) return { ok: false, log, cancelled: true };
+          if (wantState === "text") {
+            if (await this._hasText(tabId, step.text)) {
+              seen = true;
+              break;
+            }
+          } else {
+            let locator = opts.locators.get(rawStep);
+            if (!locator) {
+              locator = await this._makeLocator(tabId, step, vars);
+              opts.locators.set(rawStep, locator);
+            }
+            if (locator) {
+              const [{ result: st }] = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: (loc) => {
+                  const r = globalThis.__aiCtl.resolveLocator(loc);
+                  if (!r.ok) return { found: false, disabled: false };
+                  let disabled = false;
+                  try {
+                    disabled = !!(r.el.disabled || r.el.getAttribute("aria-disabled") === "true");
+                  } catch (_) {}
+                  return { found: true, disabled };
+                },
+                args: [locator],
+              });
+              const found = !!(st && st.found);
+              const disabled = !!(st && st.disabled);
+              if (
+                (wantState === "enabled" && found && !disabled) ||
+                (wantState === "disabled" && (!found || disabled)) ||
+                (wantState === "present" && found) ||
+                (wantState === "absent" && !found)
+              ) {
+                seen = true;
+                break;
+              }
+            }
+          }
+          await sleepMs(300);
+        }
+        const what = wantState === "text" ? `「${clip(step.text || "", 20)}」` : `目标${wantState}`;
+        log.push(seen ? `✓ 等到${what}` : `✗ 等${what}超时（${timeout}ms）`);
+        if (!seen) {
+          // 等不到不算"这一步操作失败"，但本轮视为没推进（交给轮末的 until/停滞判断）
+          if (step.optional !== true) allOk = false;
+          failed = true;
+        }
+        continue;
+      }
+
+      // —— 其它：先定位，再交给 act 执行（与 AI 手动操作同一条路）——
+      let locator = opts.locators.get(rawStep);
+      if (!locator && (step.target != null || step.text)) {
+        locator = await this._makeLocator(tabId, step, vars);
+        opts.locators.set(rawStep, locator);
+      }
+      let targetIdx = null;
+      if (locator) {
+        const [{ result: res }] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (loc) => {
+            const r = globalThis.__aiCtl.resolveLocator(loc);
+            return r.ok ? { ok: true, idx: r.idx, how: r.how } : { ok: false, how: r.how, reason: r.reason, candidates: r.candidates };
+          },
+          args: [locator],
+        });
+        if (res && res.ok) {
+          targetIdx = res.idx;
+          if (res.how !== "index") log.push(`  （元素改按 ${res.how} 找回）`);
+        } else {
+          allOk = false;
+          const cand = res && res.candidates && res.candidates.length ? "；页面上的同名候选：" + res.candidates.map((c) => c.text).join(" / ") : "";
+          log.push(`✗ 定位不到目标（${(res && res.reason) || "未知"}）${cand}`);
+          return { ok: false, log, locatorFailed: true, step };
+        }
+      }
+
+      const mapped = { action: op, target: targetIdx != null ? targetIdx : step.target };
+      if (op === "press" || op === "key") mapped.action = "press";
+      if (step.value !== undefined) mapped.value = op === "select" ? step.option != null ? step.option : step.value : this._tpl(step.value, vars);
+      if (step.key !== undefined) mapped.key = step.key;
+      if (step.direction !== undefined || step.dir !== undefined) mapped.direction = step.direction || step.dir;
+      if (step.amount !== undefined) mapped.amount = step.amount;
+      if (step.human !== undefined) mapped.human = step.human;
+      if (step.speed !== undefined) mapped.speed = step.speed;
+
+      let result = null;
+      for (let attempt = 0; attempt <= retry.times; attempt++) {
+        try {
+          const [{ result: r }] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: (a) => globalThis.__aiCtl.act(a),
+            args: [mapped],
+          });
+          result = r && typeof r === "object" ? r : null;
+        } catch (err) {
+          result = { ok: false, msg: "页面没响应：" + ((err && err.message) || err) };
+        }
+        if (result && result.ok) break;
+        if (attempt < retry.times) {
+          log.push(`✗ ${result ? result.msg : "步骤失败"} → ${retry.intervalMs}ms 后重试`);
+          await sleepMs(retry.intervalMs);
+        }
+      }
+      log.push(`${result && result.ok ? "✓" : "✗"} ${(result && result.msg) || op}`);
+      if (!result || !result.ok) {
+        allOk = false;
+        actionFailed = true;
+        if (result && result.hint) log.push(`  ↳ ${result.hint}`);
+      }
+    }
+
+    // 变量落地：本轮动作都成功了才改（失败的一轮不动页码，避免脏数据）
+    if (pendingVars.length) {
+      if (actionFailed) {
+        log.push(`· 本轮动作没成，变量不变（${pendingVars.map((p) => p.key + " 保持 " + vars[p.key]).join("、")}）`);
+      } else {
+        for (const ch of pendingVars) {
+          vars[ch.key] = ch.value;
+          log.push(`# 变量 ${ch.key} = ${vars[ch.key]}`);
+        }
+      }
+    }
+    return { ok: allOk, log };
+  }
+
+  // 停止条件：present/absent/absentText/disabled（都用定位器，不再"按文字取第一个"）
+  async _untilMet(tabId, until, vars, locators) {
+    if (!until) return false;
+    const op = String(until.op || until.type || "").toLowerCase();
+    const text = this._tpl(until.text || "", vars);
+    if (op === "absenttext") return !(await this._hasText(tabId, text));
+    if (op === "presenttext") return await this._hasText(tabId, text);
+    if (op === "present" || op === "absent" || op === "disabled") {
+      let locator = locators.get(until);
+      if (!locator) {
+        locator = await this._makeLocator(tabId, { ...until, text }, vars);
+        locators.set(until, locator);
+      }
+      if (!locator) return false;
+      const [{ result: res }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (loc) => {
+          const r = globalThis.__aiCtl.resolveLocator(loc);
+          if (!r.ok) return { found: false };
+          let disabled = false;
+          try {
+            disabled = !!(r.el.disabled || r.el.getAttribute("aria-disabled") === "true");
+          } catch (_) {}
+          return { found: true, disabled, how: r.how };
+        },
+        args: [locator],
+      });
+      const found = !!(res && res.found);
+      if (op === "present") return found;
+      if (op === "disabled") return !found || !!res.disabled; // 变灰/找不到都算"到头了"
+      return !found;
+    }
+    return false;
+  }
+
+  // 主循环
+  async runAutomationLoop(cfg) {
+    const { tabId, name, instruction, repeat, intervalMs, maxMs, stallLimit, retry, until, guard, stopIf, vars, steps } = cfg;
+    const t0 = Date.now();
+    const log = [];
+    const locators = new Map();
+    let rounds = 0;
+    let stoppedBy = "repeat";
+    let prev = await this._probe(tabId);
+    let stalled = 0;
+
+    for (let i = 1; i <= repeat; i++) {
+      if (this.automationCancel) {
+        stoppedBy = "cancelled";
+        break;
+      }
+      if (Date.now() - t0 > maxMs) {
+        stoppedBy = "timeout";
+        break;
+      }
+      rounds = i;
+      this.activeDeferTask = {
+        ...(this.activeDeferTask || {}),
+        id: cfg.taskId,
+        until: { type: "automation", name },
+        label: `自动化任务：${name}（第 ${i}/${repeat} 轮${vars.page != null ? " · 页码 " + vars.page : ""}）`,
+        instruction: cfg.instruction,
+      };
+      this.ctx.onDeferChange(this);
+      this.setStatus(`自动化任务「${name}」第 ${i}/${repeat} 轮`, "busy");
+
+      // 每轮开始前先在轮首等页面稳定（跨过"点击后页面忙"的窗口），
+      // 但**不在轮首判 until** —— 点击后按钮会短暂变灰（防重复提交），
+      // 在轮首判会把它误当成"到头了"（老设计第 2 轮就停了，就是这个原因）。
+      await this._settle(tabId, 3000);
+
+      // 兜底清弹窗：出现就点掉，别让它挡住后面的操作
+      for (const g of guard) {
+        if (g.text && (await this._hasText(tabId, this._tpl(g.text, vars)))) {
+          const r = await this._runSteps(tabId, [{ op: "click", text: this._tpl(g.text, vars) }], vars, { locators, retry });
+          if (r.log && r.log.length) log.push(`· guard：${r.log[r.log.length - 1]}`);
+        }
+      }
+      // 被拦（登录/验证码）→ 立刻停下来汇报，不硬点
+      let blocked = null;
+      for (const s of stopIf) {
+        if (s.text && (await this._hasText(tabId, this._tpl(s.text, vars)))) {
+          blocked = this._tpl(s.text, vars);
+          break;
+        }
+      }
+      if (blocked) {
+        stoppedBy = "stopIf:" + blocked;
+        break;
+      }
+
+      const res = await this._runSteps(tabId, steps, vars, { locators, retry });
+      for (const line of res.log) log.push(`#${i} ${line}`);
+      if (res.cancelled) {
+        stoppedBy = "cancelled";
+        break;
+      }
+      if (res.locatorFailed) {
+        stoppedBy = "locatorFailed";
+        break;
+      }
+
+      // 轻量验证：页面有没有真的推进（不拍快照，避免重编号）
+      const now = await this._probe(tabId);
+      const progressed =
+        !prev || !now
+          ? true
+          : now.url !== prev.url || now.marks !== prev.marks || now.textLen !== prev.textLen || now.scrollY !== prev.scrollY;
+
+      // 停止条件（**轮末**判）：要求"目标已不可点/找不到" **且这一轮确实没推进**。
+      // 这样"点击后按钮短暂变灰"不会被误判成到头；但真到最后一页（点了也没反应）就会停。
+      if (until && !progressed && (await this._untilMet(tabId, until, vars, locators))) {
+        stoppedBy = "until:" + String(until.op || until.type || "");
+        log.push(`#${i} ✔ 已到尽头（${stoppedBy}，本轮页面没有推进）`);
+        prev = now;
+        break;
+      }
+
+      if (!progressed) {
+        stalled++;
+        log.push(`#${i} ⚠ 页面没有变化（${stalled}/${stallLimit}）`);
+        if (stalled >= stallLimit) {
+          stoppedBy = "stalled";
+          break;
+        }
+      } else {
+        stalled = 0;
+      }
+      prev = now;
+      if (intervalMs) await sleepMs(intervalMs);
+    }
+
+    return { ok: true, taskId: cfg.taskId, instruction: cfg.instruction, name, rounds, stoppedBy, elapsedMs: Date.now() - t0, vars: { ...vars }, log };
+  }
+
+  // 跑完：收起横条 → 把结构化结果告诉 AI，并**唤醒它检查现状**（与后台任务唤醒同一条路）
+  async finishAutomation(result) {
+    const wasCancelled = result.stoppedBy === "cancelled" || this.automationCancel;
+    this.automationCancel = false;
+    this.activeDeferTask = null;
+    this.ctx.onDeferChange(this);
+    const head =
+      `自动化任务「${result.name || "未命名"}」结束：跑了 ${result.rounds || 0} 轮，停止原因 ${result.stoppedBy || "?"}` +
+      (result.detail ? `（${clip(result.detail, 160)}）` : "");
+    const detail = (result.log || []).slice(-14).join("\n");
+    this.addNoteBubble(head + (detail ? "\n执行记录：\n" + detail : ""));
+    this.setStatus(head, wasCancelled ? "" : "ok");
+
+    // 把结果作为一条"动作执行结果"写进会话，供 AI 唤醒后直接看到
+    try {
+      const payload = {
+        automation: result.name,
+        rounds: result.rounds,
+        stoppedBy: result.stoppedBy,
+        vars: result.vars,
+        log: (result.log || []).slice(-20),
+      };
+      this.session.messages.push({
+        role: "user",
+        content:
+          `【自动化任务结果】${head}\n` +
+          `变量现状：${JSON.stringify(result.vars || {})}\n` +
+          (detail ? `执行记录：\n${detail}\n` : "") +
+          `\n（这是程序跑完的结果。请**先读取页面确认现状**，再执行剩下的任务；` +
+          `如果停止原因是 locatorFailed/stalled/stopIf，说明页面结构和预期不一样，先判断原因再决定怎么做。）`,
+        isActionResult: true,
+      });
+      await this.ctx.saveSession(this.session);
+    } catch (_) {}
+
+    if (wasCancelled) {
+      // 用户主动停的：把后台任务也撤掉，不唤醒
+      try {
+        await chrome.runtime.sendMessage({ type: "defer:cancel", taskId: result.taskId || "" });
+      } catch (_) {}
+      return;
+    }
+    // 正常结束/deferred：让 SW 立刻唤醒 AI（这样侧栏关掉也会被兜底超时唤醒）
+    try {
+      await chrome.runtime.sendMessage({
+        type: "defer:fired",
+        taskId: result.taskId,
+        reason: head,
+      });
+    } catch (_) {}
   }
 
   // ===== 读取页面上下文 =====
@@ -899,101 +1474,7 @@ export class WorkspaceRuntime {
     //   ③ 程序跑完由**页面**直接发 defer:fired → SW 唤醒 AI（不依赖侧栏还活着）。
     // 判断用的是 action.action（action 是动作对象，不是字符串）
     if (action.action === "automate" || action.action === "automation" || action.action === "loop") {
-      const steps = Array.isArray(action.steps) ? action.steps.filter((x) => x && typeof x === "object") : [];
-      if (!steps.length) {
-        return {
-          ok: false,
-          msg: "automate 需要 steps（要循环做什么）",
-          hint:
-            '{"action":"automate","name":"翻完所有页面","repeat":80,"intervalMs":700,' +
-            '"steps":[{"op":"click","text":"下一页"},{"op":"wait","ms":400}],' +
-            '"until":{"op":"absent","text":"下一页"},"instruction":"翻完后汇报总页数并总结每一页"}',
-        };
-      }
-      const instruction = String(action.instruction || "").trim();
-      if (!instruction) {
-        return {
-          ok: false,
-          msg: "automate 需要 instruction（跑完唤醒后要做什么）",
-          hint: "比如：跑完后检查现在到第几页，并总结已经翻过的内容",
-        };
-      }
-      const name = String(action.name || "自动化任务").slice(0, 30);
-      const repeat = Math.max(1, Math.min(500, Number(action.repeat) > 0 ? Math.round(Number(action.repeat)) : 1));
-      const maxMs = Math.max(1000, Math.min(600000, Number(action.maxMs) > 0 ? Number(action.maxMs) : 120000));
-
-      const taskId = "auto_" + Math.random().toString(36).slice(2, 10);
-      let timeoutSec = Math.ceil(maxMs / 1000) + 30;
-      try {
-        let winId = null;
-        try {
-          const t = await chrome.tabs.get(tabId);
-          winId = t && t.windowId != null ? t.windowId : null;
-        } catch (_) {}
-        const resp = await chrome.runtime.sendMessage({
-          type: "defer:register",
-          task: {
-            id: taskId,
-            instruction,
-            until: { type: "automation", name, repeat, steps: steps.length },
-            tabId,
-            windowId: winId,
-            workspaceId: this.ws.id,
-            timeoutSec,
-            label: `自动化任务：${name}`,
-          },
-        });
-        if (resp && resp.timeoutSec) timeoutSec = resp.timeoutSec;
-      } catch (err) {
-        return { ok: false, msg: "自动化任务注册失败：" + (err.message || err) };
-      }
-
-      const spec = {
-        taskId,
-        name,
-        repeat,
-        intervalMs: Number(action.intervalMs) >= 0 ? Number(action.intervalMs) : 300,
-        maxMs,
-        steps,
-        until: action.until && typeof action.until === "object" ? action.until : null,
-      };
-
-      // 让界面立刻显示"自动化任务运行中"（与后台任务同一个横条）
-      this.activeDeferTask = {
-        id: taskId,
-        until: { type: "automation", name },
-        label: `自动化任务：${name}（运行中，最多 ${repeat} 轮）`,
-        instruction,
-      };
-      this.ctx.onDeferChange(this);
-      this.setStatus(`自动化任务运行中：${name}`, "busy");
-
-      let pageResult = null;
-      try {
-        await injectScript(tabId, "content/control.js");
-        const [{ result: r }] = await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (sp) => globalThis.__aiCtl.automate(sp),
-          args: [spec],
-        });
-        pageResult = r && typeof r === "object" ? r : null;
-      } catch (err) {
-        pageResult = { ok: false, msg: "页面中断了这个自动化任务（可能发生了跳转/关页）：" + (err.message || err) };
-      }
-
-      // 页面已经发过 defer:fired 唤醒 AI；这里只负责把结果告诉用户与后续步骤
-      const summary = pageResult
-        ? `自动化任务「${name}」结束：${pageResult.iterations || 0} 轮，停止原因 ${pageResult.stoppedBy || "?"}` +
-          (pageResult.log && pageResult.log.length ? "\n执行记录：\n" + pageResult.log.slice(-12).join("\n") : "")
-        : `自动化任务「${name}」以未知原因结束`;
-      return {
-        ok: true,
-        deferred: true,
-        taskId,
-        automation: true,
-        msg: summary,
-        detail: pageResult || undefined,
-      };
+      return this.startAutomation(tabId, action);
     }
 
     let beforeUrl = "";

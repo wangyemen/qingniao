@@ -1176,6 +1176,51 @@
     }
     // 列表按编号排序，保证模型看到的编号是递增的
     list.sort((a, b) => a.i - b.i);
+
+    // 同名歧义消解：同一个标签出现多次时（页头/页脚常有同名按钮），
+    // 给每一条补上三样东西，让模型能**挑对那一个**：
+    //   ① 同名序号（第 2/3 个）② 所处位置（上部/中部/下部）③ 附近的文字
+    // 没有这些，模型只能猜编号，猜错就会点到没用的假按钮上
+    //（用户反馈"AI 能点、自动程序点不动"的根源之一）。
+    const labelCount = new Map();
+    for (const it of list) {
+      const k = (it.label || "").toLowerCase();
+      if (!k) continue;
+      labelCount.set(k, (labelCount.get(k) || 0) + 1);
+    }
+    const labelSeen = new Map();
+    for (const it of list) {
+      const k = (it.label || "").toLowerCase();
+      if (!k) continue;
+      const total = labelCount.get(k) || 0;
+      labelSeen.set(k, (labelSeen.get(k) || 0) + 1);
+      if (total < 2) continue;
+      it.sameLabel = `${labelSeen.get(k)}/${total}`;
+      try {
+        const rec = idxMap.get(it.i);
+        const el = rec && rec.el;
+        if (el) {
+          const r = el.getBoundingClientRect();
+          const vh = window.innerHeight || 800;
+          const center = r.top + r.height / 2;
+          it.pos = center < vh / 3 ? "上部" : center > (vh * 2) / 3 ? "下部" : "中部";
+          let p = el.parentElement;
+          let hint = "";
+          let depth = 0;
+          while (p && depth < 3) {
+            const own = clip(p.innerText || "", 40);
+            if (own && own !== it.label) {
+              hint = own;
+              break;
+            }
+            p = p.parentElement;
+            depth++;
+          }
+          if (hint) it.near = hint;
+        }
+      } catch (_) {}
+    }
+
     return {
       url: location.href,
       title: document.title,
@@ -2359,248 +2404,223 @@
     return true;
   }
 
-  // ===== 自动化任务：把"重复性动作"交给程序跑循环 =====
+  // ===== 定位器：把"一次性的元素编号"变成"可以反复找回的描述" =====
   //
-  // 为什么要有它：像"点一下等两秒、循环 3 次""PPT 一页页翻到底"这类事，
-  // 如果每步都走一次模型，又慢又费 token。AI 只需要声明"循环做什么 / 什么时候停"，
-  // 循环在这里跑完，跑完再唤醒 AI 检查现状、接着干剩下的。
-  //
-  // 安全性：① 迭代上限 500；② 总时长上限（默认 2 分钟，最多 10 分钟）；
-  //         ③ 连续 5 轮动作全部失败就停；④ 正常结束与异常都会回报，绝不静默卡死。
-  const AUTOMATE_MAX_ITER = 500;
-  const AUTOMATE_MAX_MS = 10 * 60 * 1000;
-  const AUTOMATE_FAIL_LIMIT = 5;
-
-  function autoSleep(ms) {
-    return new Promise((r) => setTimeout(r, Math.max(0, Math.min(20000, ms || 0))));
+  // 为什么需要：编号表每次 snapshot() 都会 clear() 重编号（号只在"当下这一份"里有效），
+  // 而自动化要跨很多轮用同一个目标，中途页面还会变（翻页会改内容、冒提示条）——
+  // 光靠编号会指错元素。所以自动化开工时先把编号翻译成一份"定位器"，
+  // 之后每轮按四层降级找回：同号 → 路径/锚点 → 文字+就近 → 失败（宁可停下，也不乱点）。
+  function cssPathOf(el) {
+    const parts = [];
+    let cur = el;
+    let depth = 0;
+    while (cur && cur.nodeType === 1 && depth < 6) {
+      let sel = cur.tagName.toLowerCase();
+      const parent = cur.parentElement;
+      if (parent) {
+        const same = [...parent.children].filter((c) => c.tagName === cur.tagName);
+        if (same.length > 1) sel += `:nth-of-type(${same.indexOf(cur) + 1})`;
+      }
+      parts.unshift(sel);
+      cur = parent;
+      depth++;
+    }
+    return parts.join(" > ");
   }
 
-  function keyCodeOf(key) {
-    const map = {
-      ArrowRight: 39,
-      ArrowLeft: 37,
-      ArrowDown: 40,
-      ArrowUp: 38,
-      PageDown: 34,
-      PageUp: 33,
-      Enter: 13,
-      Space: 32,
-      " ": 32,
-    };
-    return map[key] || 0;
+  // 附近的"稳定文字"（祖先容器里的短文本），用作锚点
+  function anchorsOf(el) {
+    const out = [];
+    let p = el.parentElement;
+    let depth = 0;
+    while (p && depth < 3) {
+      const own = clip(p.innerText || "", 60);
+      if (own) out.push(own);
+      p = p.parentElement;
+      depth++;
+    }
+    return out.slice(0, 3);
   }
 
-  // 页面"看起来变了没"：用于 nochange 停止条件（翻到底/没有下一页了）
-  function pageSignature() {
+  function rectOf(el) {
     try {
-      const t = (document.body && document.body.innerText) || "";
-      const marks = (t.match(/第\s*\d+\s*页|\d+\s*\/\s*\d+/g) || []).join("|");
-      return [
-        document.title,
-        location.href,
-        t.length,
-        marks,
-        window.scrollY,
-        document.body ? document.body.scrollHeight : 0,
-      ].join("|");
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
     } catch (_) {
-      return String(Date.now());
+      return null;
     }
   }
 
-  // 把步骤翻译成"标准动作"后交给 act() 执行。
-  //
-  // ⚠️ 关键设计（别再改回自己实现）：
-  //    自动化**不自己实现点击/填写**，而是复用 AI 手动操作时的同一套工具
-  //    —— 先 find 解析目标（多策略定位、编号表），再 act 执行（合成事件链、回读校验、
-  //    富文本处理都在里面）。自动化只是把这些工具调用"串联起来跑循环"。
-  //    我一开始另写了一份简化定位，结果真实页面上"找不到下一页"，
-  //    而同一个页面上 act 的 click 就能点到 —— 两套实现必然分叉。
-  async function autoResolveTarget(step) {
-    if (step.target != null && step.target !== "") return { target: Number(step.target), label: "" };
-    const q = step.text || step.label || "";
-    if (!q) return { target: null, label: "" };
-    const r = await act({ action: "find", text: String(q) });
-    if (!r || !r.ok || !r.data) return { target: null, label: String(q) };
-    const m = /\[(\d+)\]/.exec(String(r.data));
-    return m ? { target: Number(m[1]), label: String(q) } : { target: null, label: String(q) };
-  }
-
-  async function autoStep(step) {
-    const op = String((step && (step.op || step.type)) || "click").toLowerCase();
-
-    if (op === "wait" || op === "sleep") {
-      const ms = Number(step.ms) > 0 ? Number(step.ms) : Number(step.seconds) > 0 ? Number(step.seconds) * 1000 : 500;
-      await autoSleep(ms);
-      return { ok: true, msg: `等待 ${ms}ms` };
-    }
-
-    // 需要定位目标的步骤：先 find（与手动操作同一条路径），再 act
-    if (["click", "fill", "type", "select", "check", "extract"].includes(op)) {
-      const { target, label } = await autoResolveTarget(step);
-      if (target == null) {
-        return {
-          ok: false,
-          msg: `找不到要操作的「${label || step.selector || "元素"}」（用的就是手动操作那套定位）`,
-        };
-      }
-      const mapped = { action: op, target };
-      if (op === "fill" || op === "type") {
-        mapped.value = step.value == null ? "" : String(step.value);
-        if (step.human !== undefined) mapped.human = step.human === true || step.human === "true";
-        if (step.speed !== undefined) mapped.speed = step.speed;
-      }
-      if (op === "select") mapped.value = step.option == null ? step.value : step.option;
-      if (op === "check") mapped.value = !(step.value === false || step.value === "false");
-      const r = await act(mapped);
-      return r && typeof r === "object"
-        ? { ...r, msg: r.msg || `${op}「${label}」` }
-        : { ok: false, msg: "页面没有响应这个步骤" };
-    }
-
-    // 不需要目标的步骤：直接翻译成标准动作
-    if (op === "press" || op === "key") {
-      const r = await act({ action: "press", key: String(step.key || step.text || "ArrowRight") });
-      return r && typeof r === "object" ? r : { ok: false, msg: "按键没生效" };
-    }
-    if (op === "scroll") {
-      const r = await act({
-        action: "scroll",
-        direction: String(step.dir || step.direction || "down"),
-        amount: Number(step.amount) > 0 ? Number(step.amount) : undefined,
-      });
-      return r && typeof r === "object" ? r : { ok: false, msg: "滚动没生效" };
-    }
-    if (op === "navigate") {
-      const r = await act({ action: "navigate", url: String(step.url || "") });
-      return r && typeof r === "object" ? r : { ok: false, msg: "跳转没生效" };
-    }
-    if (op === "screenshot") {
-      const r = await act({ action: "screenshot" });
-      return r && typeof r === "object" ? r : { ok: false, msg: "截图失败" };
-    }
-    return { ok: false, msg: `不认识的步骤：${op}` };
-  }
-
-  // 停止条件：present / absent / disabled（按钮变灰后 find 就找不到了）/ nochange
-  async function autoUntilMet(until, iter, sig, prevSig) {
-    if (!until || typeof until !== "object") return false;
-    const op = String(until.op || until.type || "").toLowerCase();
-    if (op === "nochange") return iter >= 2 && sig === prevSig;
-    if (op === "absent" || op === "present" || op === "disabled") {
-      const q = until.text || until.label || "";
-      if (!q) return false;
-      const r = await act({ action: "find", text: String(q) });
-      const found = !!(r && r.ok && r.data);
-      if (op === "present") return found;
-      // absent 与 disabled 都表示"这个按钮找不到 / 不可操作了"
-      return !found;
-    }
-    return false;
-  }
-
-  async function automate(spec) {
-    const s = spec && typeof spec === "object" ? spec : {};
-    const steps = Array.isArray(s.steps) ? s.steps.filter((x) => x && typeof x === "object") : [];
-    if (!steps.length) {
-      return {
-        ok: false,
-        msg: "automate 需要 steps（要循环做什么）",
-        hint: '例如 {"action":"automate","repeat":3,"steps":[{"op":"click","text":"继续"},{"op":"wait","ms":2000}]}',
-      };
-    }
-    const repeat = Math.max(1, Math.min(AUTOMATE_MAX_ITER, Number(s.repeat) > 0 ? Math.round(Number(s.repeat)) : 1));
-    const intervalMs = Math.max(0, Math.min(20000, Number(s.intervalMs) >= 0 ? Number(s.intervalMs) : 300));
-    const maxMs = Math.max(1000, Math.min(AUTOMATE_MAX_MS, Number(s.maxMs) > 0 ? Number(s.maxMs) : 120000));
-    const until = s.until && typeof s.until === "object" ? s.until : null;
-
-    const startedAt = Date.now();
-    const log = [];
-    let iterations = 0;
-    let stoppedBy = "repeat";
-    let failStreak = 0;
-    let prevSig = pageSignature();
-    const push = (m) => {
-      if (log.length < 60) log.push(m);
+  // 用"编号"生成定位器（自动化开工时调用一次）
+  function makeLocator(idx) {
+    const el = findByIdx(idx);
+    if (!el) return null;
+    return {
+      index: Number(idx),
+      text: clip(directSearchText(el) || searchText(el) || "", 60),
+      role: (() => {
+        try {
+          return axRole(el) || el.tagName.toLowerCase();
+        } catch (_) {
+          return el.tagName.toLowerCase();
+        }
+      })(),
+      aria: el.getAttribute && el.getAttribute("aria-label") ? clip(el.getAttribute("aria-label"), 60) : "",
+      id: el.id || "",
+      name: el.getAttribute && el.getAttribute("name") ? el.getAttribute("name") : "",
+      path: cssPathOf(el),
+      near: anchorsOf(el),
+      rect: rectOf(el),
     };
+  }
 
-    try {
-      for (let i = 1; i <= repeat; i++) {
-        if (Date.now() - startedAt > maxMs) {
-          stoppedBy = "timeout";
-          break;
-        }
-        const sig = pageSignature();
-        // 注意：autoUntilMet 是 async 的，必须 await —— 忘记 await 会得到"永远为真"的 Promise，
-        // 表现就是第 1 轮就判停、0 轮结束（踩过一次）。
-        if (until && (await autoUntilMet(until, i, sig, prevSig))) {
-          stoppedBy = "until:" + String(until.op || until.type || "");
-          break;
-        }
-        prevSig = sig;
-        iterations = i;
-        let roundOk = false;
-        for (const step of steps) {
-          if (Date.now() - startedAt > maxMs) {
-            stoppedBy = "timeout";
-            break;
-          }
-          let r;
-          try {
-            r = await autoStep(step);
-          } catch (err) {
-            r = { ok: false, msg: String((err && err.message) || err) };
-          }
-          push(`#${i} ${r.ok ? "✓" : "✗"} ${r.msg || ""}`);
-          if (r.ok) roundOk = true;
-        }
-        if (stoppedBy === "timeout") break;
-        if (!roundOk) {
-          failStreak++;
-          if (failStreak >= AUTOMATE_FAIL_LIMIT) {
-            stoppedBy = "stepFailed";
-            break;
-          }
-        } else {
-          failStreak = 0;
-        }
-        if (intervalMs) await autoSleep(intervalMs);
+  // 元素还"像不像"当初那个（用于第①层：号还在，但要防号位移指错人）
+  function locatorMatches(el, loc, loose) {
+    if (!el || !el.isConnected) return false;
+    if (loc.aria) {
+      const a = el.getAttribute && el.getAttribute("aria-label");
+      if (a && norm(a) !== norm(loc.aria)) return false;
+    }
+    if (loc.id && el.id && el.id !== loc.id) return false;
+    if (loc.text) {
+      const t = norm(directSearchText(el) || searchText(el) || "").toLowerCase();
+      const want = norm(loc.text).toLowerCase();
+      if (t !== want && !(loose && t.includes(want))) return false;
+    }
+    return true;
+  }
+
+  // 按文字+角色找候选（返回可见可操作的元素，按 DOM 顺序）
+  function candidatesByText(text, role) {
+    const want = norm(text).toLowerCase();
+    if (!want) return [];
+    const out = [];
+    for (const { el } of deepQuery(INTERACTIVE_SEL)) {
+      if (!isVisible(el) && !isHiddenToggleUsable(el)) continue;
+      const t = norm(directSearchText(el) || searchText(el) || "").toLowerCase();
+      if (!t || !t.includes(want)) continue;
+      if (role) {
+        let r = "";
+        try {
+          r = (axRole(el) || el.tagName.toLowerCase()).toLowerCase();
+        } catch (_) {}
+        if (r && r !== String(role).toLowerCase() && el.tagName.toLowerCase() !== String(role).toLowerCase()) continue;
       }
-      if (iterations >= repeat && stoppedBy === "repeat" && until) stoppedBy = "repeat(未满足停止条件)";
-    } catch (err) {
-      stoppedBy = "error";
-      push("异常：" + String((err && err.message) || err));
+      out.push(el);
+    }
+    return out;
+  }
+
+  // 四层降级找回元素。**任何一层都不行就返回 ok:false** —— 宁可停下，也不乱点。
+  function resolveLocator(loc) {
+    const res = { ok: false, how: "", el: null, idx: null, candidates: [], reason: "" };
+    if (!loc || typeof loc !== "object") {
+      res.reason = "没有定位信息";
+      return res;
     }
 
-    const elapsedMs = Date.now() - startedAt;
-    const result = {
-      ok: true,
-      msg: `自动化任务结束：跑了 ${iterations} 轮（约 ${Math.round(elapsedMs / 1000)} 秒，停止原因 ${stoppedBy}）`,
-      iterations,
-      stoppedBy,
-      elapsedMs,
-      log,
-      pageHint: {
-        title: document.title,
-        url: location.href,
-        scrollY: Math.round(window.scrollY),
-        scrollHeight: document.body ? document.body.scrollHeight : 0,
-      },
-    };
+    // ① 同号：表没重建、元素还在、且"还像当初那个"
+    if (loc.index != null && loc.index !== "") {
+      const el = findByIdx(loc.index);
+      if (el && locatorMatches(el, loc, false)) {
+        res.ok = true;
+        res.how = "index";
+        res.el = el;
+        res.idx = Number(loc.index);
+        return res;
+      }
+    }
 
-    // 关键一步：**由页面直接通知 SW**"自动化任务结束"，SW 会唤醒 AI 去检查现状并接着干。
-    // 放在页面里发（而不是靠侧栏 await），这样即使侧栏在跑的过程中被关掉/切走，也一定唤醒。
-    if (s.taskId) {
+    // ② 结构路径
+    if (loc.path) {
       try {
-        chrome.runtime.sendMessage({
-          type: "defer:fired",
-          taskId: s.taskId,
-          reason: `自动化任务「${s.name || "未命名"}」结束：跑了 ${iterations} 轮，停止原因 ${stoppedBy}`,
-        });
+        const el = document.querySelector(loc.path);
+        if (el && isVisible(el) && locatorMatches(el, loc, true)) {
+          res.ok = true;
+          res.how = "path";
+          res.el = el;
+          res.idx = reserveIndex(el, null);
+          return res;
+        }
       } catch (_) {}
     }
-    return result;
+
+    // ③ 文字（+角色）候选：多个时挑"离上次位置最近"的那个
+    const cands = candidatesByText(loc.text || loc.aria || "", loc.role);
+    res.candidates = cands.slice(0, 6).map((el) => ({
+      text: clip(directSearchText(el) || searchText(el) || "", 40),
+      rect: rectOf(el),
+    }));
+    if (cands.length === 1) {
+      res.ok = true;
+      res.how = "text";
+      res.el = cands[0];
+      res.idx = reserveIndex(cands[0], null);
+      return res;
+    }
+    if (cands.length > 1) {
+      let best = cands[0];
+      let bestD = Infinity;
+      const target = loc.rect;
+      for (const el of cands) {
+        const r = rectOf(el);
+        const d = target && r ? Math.abs(r.y - target.y) + Math.abs(r.x - target.x) : 0;
+        if (d < bestD) {
+          bestD = d;
+          best = el;
+        }
+      }
+      res.ok = true;
+      res.how = "text-nearest";
+      res.el = best;
+      res.idx = reserveIndex(best, null);
+      return res;
+    }
+
+    res.reason = loc.text ? `页面上再也找不到「${clip(loc.text, 20)}」` : "定位信息不足";
+    return res;
   }
 
-  globalThis.__aiCtl = { snapshot, act, banner, armDefer, disarmDefer, automate };
+  // 轻量探针：只报"页面现在长什么样"，**不碰编号表**
+  // （自动化每轮用它判断有没有推进；不能调 snapshot()，那会 clear() 重编号）
+  function probePage() {
+    let text = "";
+    try {
+      text = norm(document.body ? document.body.innerText : "").slice(0, 4000);
+    } catch (_) {}
+    const marks = (text.match(/第\s*\d+\s*页|\d+\s*\/\s*\d+|\d+\s*of\s*\d+/gi) || []).join("|");
+    return {
+      ok: true,
+      url: location.href,
+      title: document.title,
+      textLen: text.length,
+      marks,
+      sample: text.slice(0, 300),
+      hasText: (q) => text.includes(q),
+      scrollY: Math.round(window.scrollY),
+      scrollHeight: document.body ? document.body.scrollHeight : 0,
+    };
+  }
+
+  // 判断某段文字在不在页面上（waitFor / guard / stopIf 用；不碰编号表）
+  function hasText(q) {
+    if (!q) return false;
+    try {
+      return norm(document.body ? document.body.innerText : "").includes(norm(q));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  globalThis.__aiCtl = {
+    snapshot,
+    act,
+    banner,
+    armDefer,
+    disarmDefer,
+    makeLocator,
+    resolveLocator,
+    probePage,
+    hasText,
+  };
 })();
