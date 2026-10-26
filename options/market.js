@@ -342,10 +342,24 @@ async function installMarketSkill(m, btn) {
     const { meta, body } = parseSkillMd(text);
     const skill = makeSkill({ meta, body, fallbackId: m.id });
     if (!skill.id) throw new Error("技能缺少 name 字段");
-    const prev = skills[skill.id] || {};
     const fromUser = isUserMarket() || m.market === "user";
+
+    // ⚠️ 同名保护（用户要求：上传的技能 id 要唯一）：
+    //    本地已经有**同名但不同来源**的技能时，别默默覆盖它（尤其别把官方技能覆盖掉 ✗）
+    //    → 装成 <id>-user 并说明白。
+    let installId = skill.id;
+    const sameId = skills[installId];
+    const sameSource = !!(sameId && sameId.marketSource && sameId.marketSource === (marketSource || currentSource()));
+    if (sameId && !sameSource) {
+      let n = 1;
+      let cand = `${skill.id}-user`;
+      while (skills[cand]) cand = `${skill.id}-user-${++n}`;
+      installId = cand;
+    }
+    const prev = skills[installId] || {};
     const saved = await upsertSkill({
       ...skill,
+      id: installId,
       title: skill.title || m.title,
       description: skill.description || m.description,
       icon: skill.icon || m.icon,
@@ -385,6 +399,54 @@ function bindMine() {
   $("exportAllBtn").addEventListener("click", exportAll);
   const cleanup = $("cleanupMetaBtn");
   if (cleanup) cleanup.addEventListener("click", cleanupSkillMeta);
+
+  // 「填入 editToken」：给**以前从网页投过**（那时官网还收投稿）的人用 ——
+  // 网页那次没把 token 存进插件，所以卡片上什么都不会显示 ✗。
+  // 只要你还留着那串 token，填一次就能挂到本地同名技能上，之后就能查状态/改/撤 ✓。
+  const claim = document.createElement("button");
+  claim.className = "tiny";
+  claim.textContent = "填入 editToken";
+  claim.title = "以前从网页投过？把当时那串 editToken 填进来，就能在这条技能上查状态 / 改 / 撤投稿";
+  claim.addEventListener("click", claimEditToken);
+  const host = $("newSkillBtn").parentElement;
+  if (host) host.appendChild(claim);
+}
+
+// 认领一条已有的投稿：用 slug + editToken 向服务端确认，然后记到本地同名技能上
+async function claimEditToken() {
+  const slug = (prompt("投稿时的技能 id（就是那张卡片上的 slug）：", "") || "").trim();
+  if (!slug) return;
+  const token = (prompt("editToken（提交成功时给你的那串，通常你复制过）：", "") || "").trim();
+  if (!token) return;
+
+  const local = skills[slug];
+  if (!local) {
+    return setStatus(
+      `本地没有叫「${slug}」的技能。先去「用户市场」把它装上（或「新建技能」用同一个 id），再点一次「填入 editToken」。`,
+      "err"
+    );
+  }
+  const src = ($("userSourceInput").value || "").trim() || USER_MARKET_DEFAULT;
+  const manageUrl = src.replace(/(?:market|submit)\.php.*$/i, "manage.php");
+  setStatus("正在核对 editToken…");
+  try {
+    const r = await fetch(
+      `${manageUrl}?slug=${encodeURIComponent(slug)}&token=${encodeURIComponent(token)}&action=status`,
+      { cache: "no-store" }
+    );
+    const j = await r.json().catch(() => ({}));
+    if (!j || !j.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+    await upsertSkill({
+      id: slug,
+      marketSubmit: { at: Date.now(), status: j.status || "pending", url: manageUrl, slug, token, claimed: true },
+    });
+    skills = await loadSkills();
+    renderMine();
+    const st = j.status === "approved" ? "已上架" : j.status === "rejected" ? "被退回" : j.status === "hidden" ? "已下架" : "待审核";
+    setStatus(`已认领「${slug}」（状态：${st}）。editToken 现在显示在那张技能卡片上，可以查状态 / 撤回 / 以后再改。`, "ok");
+  } catch (err) {
+    setStatus("核对失败（slug 或 editToken 不对？）：" + ((err && err.message) || err), "err");
+  }
 }
 
 function renderMine() {
