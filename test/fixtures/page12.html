@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>夹具 · 刁钻编辑器与复杂页面</title>
+  <style>
+    body { font-family: "Microsoft YaHei", sans-serif; padding: 20px; max-width: 820px; }
+    h1 { font-size: 17px; }
+    .box { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 12px 0; }
+    .hint { color: #666; font-size: 12px; }
+    /* 假编辑器的"正文区"：外观与真实编辑器一致（带工具栏 + 可编辑区） */
+    .fake-editor { border: 1px solid #bbb; border-radius: 8px; overflow: hidden; }
+    .fake-editor .bar { background: #f4f4f5; padding: 6px 10px; font-size: 12px; color: #555; border-bottom: 1px solid #e5e5e5; }
+    .fake-editor .body { min-height: 90px; padding: 10px; outline: none; }
+    .fake-editor .body p { margin: 0 0 8px; }
+    #vlist { height: 130px; overflow: auto; border: 1px solid #ddd; border-radius: 8px; }
+    #vlist .row { padding: 8px 10px; border-bottom: 1px solid #eee; }
+  </style>
+</head>
+<body>
+  <h1>刁钻编辑器与复杂页面</h1>
+
+  <!-- ① 只认"真人点击才建选区"的编辑器：不点击就写不进去；输入后还会整个重建 DOM -->
+  <div class="box">
+    <div class="hint">① 刁钻编辑器（要真点击才聚焦；输入后重建 DOM）</div>
+    <div class="fake-editor" id="ed">
+      <div class="bar">工具栏（B I U）</div>
+      <div class="body" contenteditable="true" role="textbox" aria-label="正文编辑器"></div>
+    </div>
+    <div class="hint" id="edInfo">内容：空 · 内部行数：0 · 重建次数：0</div>
+  </div>
+
+  <!-- ② Shadow DOM 里的按钮与输入框 -->
+  <div class="box">
+    <div class="hint">② Shadow DOM 组件</div>
+    <div id="shadowHost"></div>
+    <div class="hint" id="shadowInfo">点击次数：0</div>
+  </div>
+
+  <!-- ③ 同源 iframe 里的按钮 -->
+  <div class="box">
+    <div class="hint">③ 同源 iframe</div>
+    <iframe id="fr" style="width:100%;height:110px;border:1px solid #ddd;border-radius:8px"></iframe>
+    <div class="hint" id="frInfo">iframe 内点击次数：0</div>
+  </div>
+
+  <!-- ④ 虚拟列表：只有滚动到的行才真正存在于 DOM 里 -->
+  <div class="box">
+    <div class="hint">④ 虚拟列表（滚到哪才渲染哪几行）</div>
+    <div id="vlist"></div>
+    <div class="hint" id="vInfo">已渲染行数：0</div>
+  </div>
+
+  <script>
+    /* ===== ① 刁钻编辑器 =====
+       模仿 ProseMirror 一类：内部有"自己的模型"，必须 mousedown 之后才认输入；
+       每次输入后把 body 节点整个换掉（真实编辑器重渲染就是这个效果）。 */
+    (function initEditor() {
+      var host = document.getElementById("ed");
+      var bar = host.querySelector(".bar");
+      var model = [];          // 编辑器自己的模型：每行一个字符串
+      var focused = false;     // 只有"真人点过"才为 true
+      var rebuilds = 0;
+
+      function renderBody() {
+        var old = host.querySelector(".body");
+        var body = document.createElement("div");
+        body.className = "body";
+        body.setAttribute("contenteditable", "true");
+        body.setAttribute("role", "textbox");
+        body.setAttribute("aria-label", "正文编辑器");
+        model.forEach(function (line) {
+          var p = document.createElement("p");
+          if (line) p.textContent = line;
+          else p.appendChild(document.createElement("br"));
+          body.appendChild(p);
+        });
+        old.replaceWith(body);   // ★ 整个换掉：外部拿到的旧引用会失效
+        rebuilds++;
+        document.getElementById("edInfo").textContent =
+          "内容：" + (model.join(" / ") || "空") + " · 内部行数：" + model.length + " · 重建次数：" + rebuilds;
+        bindInput(body);
+      }
+
+      function bindInput(body) {
+        // 只接收"真人按键"带来的输入；程序化 textContent 写入不算（这里用 beforeinput 判断）
+        body.addEventListener("keydown", function (e) {
+          if (!focused) { e.preventDefault(); return; }
+          if (e.key === "Enter") {
+            e.preventDefault();
+            model.push("");
+            renderBody();
+          }
+        });
+        body.addEventListener("beforeinput", function (e) {
+          if (!e.isTrusted) { e.preventDefault(); return; }  // 非真人输入：拒收
+        });
+        body.addEventListener("input", function (e) {
+          if (!e.isTrusted) return;
+        });
+        // 真人点一下 = 建立选区（和真实编辑器一样）
+        body.addEventListener("mousedown", function () {
+          focused = true;
+          host.dataset.focused = "1";
+        });
+      }
+
+      // 逐字输入：外部派发的 keydown 会被上面收下（键值不是一个字符时忽略）
+      host.addEventListener("keydown", function (e) {
+        if (!focused || !e.key || e.key.length !== 1) return;
+        if (model.length === 0) model.push("");
+        model[model.length - 1] += e.key;
+        renderBody();
+      });
+      // 供测试直接"模拟真人输入"（也能验证按键流通道是否通）
+      window.__editor = {
+        get text() { return model.join("\n"); },
+        get lines() { return model.length; },
+        get focused() { return focused; },
+        get rebuilds() { return rebuilds; },
+        bar: function () { return bar.textContent; },
+        reset: function () { model = []; focused = false; rebuilds = 0; renderBody(); },
+      };
+      renderBody();
+    })();
+
+    /* ===== ② Shadow DOM ===== */
+    (function initShadow() {
+      var host = document.getElementById("shadowHost");
+      var root = host.attachShadow({ mode: "open" });
+      root.innerHTML =
+        '<style>button{padding:8px 14px;border-radius:8px;border:1px solid #ccc;background:#fff}</style>' +
+        '<button id="sbtn" aria-label="影子按钮">影子里的按钮</button>' +
+        '<input id="sinput" aria-label="影子输入框" placeholder="影子输入框" style="margin-left:8px" />';
+      var n = 0;
+      root.getElementById("sbtn").addEventListener("click", function () {
+        n++;
+        document.getElementById("shadowInfo").textContent = "点击次数：" + n;
+      });
+      window.__shadowClicks = function () { return n; };
+    })();
+
+    /* ===== ③ 同源 iframe ===== */
+    (function initFrame() {
+      var f = document.getElementById("fr");
+      f.srcdoc =
+        '<body style="font-family:sans-serif;padding:10px">' +
+        '<button id="fbtn" aria-label="框架内按钮">框架内的按钮</button>' +
+        '<div id="fn">点击次数：0</div>' +
+        '<script>var c=0;document.getElementById("fbtn").addEventListener("click",function(){c++;' +
+        'document.getElementById("fn").textContent="点击次数："+c;parent.__frameClicks=c;});<\/script>' +
+        "</body>";
+    })();
+
+    /* ===== ④ 虚拟列表：100 行，只渲染可视区附近的行 ===== */
+    (function initVirtual() {
+      var list = document.getElementById("vlist");
+      var TOTAL = 100;
+      var ROW = 37;
+      list.style.position = "relative";
+      var spacer = document.createElement("div");
+      spacer.style.height = TOTAL * ROW + "px";
+      list.appendChild(spacer);
+
+      function render() {
+        var top = list.scrollTop;
+        var h = list.clientHeight;
+        var first = Math.max(0, Math.floor(top / ROW) - 1);
+        var last = Math.min(TOTAL - 1, Math.ceil((top + h) / ROW) + 1);
+        // 只留下可视区附近的行（其余从 DOM 里移除 —— 这就是"复杂页面"看不见元素的原因）
+        list.querySelectorAll(".row").forEach(function (r) {
+          var i = Number(r.dataset.i);
+          if (i < first || i > last) r.remove();
+        });
+        for (var i = first; i <= last; i++) {
+          if (list.querySelector('.row[data-i="' + i + '"]')) continue;
+          var row = document.createElement("div");
+          row.className = "row";
+          row.dataset.i = String(i);
+          row.style.position = "absolute";
+          row.style.top = i * ROW + "px";
+          row.style.left = "0";
+          row.style.right = "0";
+          row.textContent = i === 2 ? "第 2 行 · 目标条目（点我）" : "第 " + i + " 行";
+          if (i === 2) {
+            row.setAttribute("aria-label", "目标条目");
+            row.style.cursor = "pointer";
+            row.addEventListener("click", function () {
+              row.textContent = "第 2 行 · 已点中 ✓";
+              window.__hitTarget = (window.__hitTarget || 0) + 1;
+            });
+          }
+          list.appendChild(row);
+        }
+        document.getElementById("vInfo").textContent = "已渲染行数：" + list.querySelectorAll(".row").length;
+      }
+      list.addEventListener("scroll", render);
+      render();
+      window.__virtual = { rendered: function () { return list.querySelectorAll(".row").length; } };
+    })();
+  </script>
+</body>
+</html>

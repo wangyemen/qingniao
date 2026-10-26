@@ -475,6 +475,18 @@
     return false;
   }
 
+  // "像个文本输入区"（含富文本）—— 找回"还活着的那个可编辑元素"时用
+  function isTextish(el) {
+    if (!el || !el.tagName) return false;
+    const tag = el.tagName.toLowerCase();
+    if (tag === "textarea") return true;
+    if (tag === "input") {
+      const t = String(el.getAttribute("type") || "text").toLowerCase();
+      return ["text", "search", "email", "url", "tel", "number"].includes(t);
+    }
+    return isRichText(el);
+  }
+
   // 可输入判定：普通文本框 + 富文本区域
   function isEditable(el) {
     if (!el) return false;
@@ -1759,6 +1771,138 @@
     }
   }
 
+  // 真实鼠标序列地"点"一下元素（用于聚焦）。
+  //
+  // ⚠️ 为什么不能只调 el.focus()：ProseMirror / Quill / Slate / Lexical 这类编辑器
+  //    **在 mousedown/click 时才建立内部选区**。只 focus() 的话，后面写进去的内容
+  //    会落到编辑器"看不见"的地方 —— 表现就是"有时能写进去、有时写不进去"（用户反馈过）。
+  //    这里按真实顺序派发 pointerdown → mousedown → focus → pointerup → mouseup → click，
+  //    坐标取元素中心，尽量贴近真人操作。
+  function clickForFocus(el) {
+    const doc = el.ownerDocument || document;
+    const rect = (() => {
+      try {
+        const r = el.getBoundingClientRect();
+        if (r && (r.width || r.height)) return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      } catch (_) {}
+      return { x: 0, y: 0 };
+    })();
+    const common = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      clientX: rect.x,
+      clientY: rect.y,
+      screenX: rect.x,
+      screenY: rect.y,
+      button: 0,
+      buttons: 1,
+      detail: 1,
+    };
+    const fire = (type, extra) => {
+      try {
+        const Ev = type.startsWith("pointer") && typeof PointerEvent === "function" ? PointerEvent : MouseEvent;
+        el.dispatchEvent(new Ev(type, { ...common, ...(extra || {}) }));
+        return true;
+      } catch (_) {
+        return false;
+      }
+    };
+    fire("pointerdown");
+    fire("mousedown");
+    focusEl(el); // 顺便把焦点（含 iframe 窗口）也弄对
+    fire("pointerup", { buttons: 0 });
+    fire("mouseup", { buttons: 0 });
+    fire("click", { buttons: 0 });
+    return true;
+  }
+
+  // 写入之后拿"还活着的那个可编辑元素"：
+  // 框架（React/Vue/编辑器自身）常在输入后**重建 DOM**，旧引用会 isConnected=false，
+  // 于是回读永远读到空 → 误报"页面没有接受这次输入"（"有时成、有时败"的另一半原因）。
+  //
+  // ⚠️ 顺序很重要：**先看原节点所在容器里有没有活的同类元素**（编辑器重建就是"原地换一个"），
+  //    再看 activeElement，最后才在整页里按位置猜。
+  //    一上来就在整页里猜的话，页面上有多个可编辑区时会读错目标，
+  //    结果"内容其实写对了却报失败"，AI 于是反复重试、彻底迷失（测试抓到过）。
+  function liveEditable(el, doc) {
+    if (el && el.isConnected) return el;
+    const anchor = (el && el.__qnAnchor) || (el && el.parentElement) || null;
+    const pick = (root) => {
+      try {
+        if (!root || !root.querySelector) return null;
+        const c = root.querySelector('[contenteditable="true"], [role="textbox"], textarea, input[type="text"]');
+        return c && c.isConnected ? c : null;
+      } catch (_) {
+        return null;
+      }
+    };
+    const inAnchor = pick(anchor);
+    if (inAnchor && isTextish(inAnchor)) return inAnchor;
+
+    const d = (el && el.ownerDocument) || doc || document;
+    try {
+      const ae = d.activeElement;
+      if (ae && ae !== d.body && ae !== d.documentElement && isTextish(ae)) return ae;
+    } catch (_) {}
+
+    // 退一步：找"离原来位置最近"的可编辑区（比较保守，只在只有一个候选时才直接用）
+    try {
+      const r0 = (() => {
+        try {
+          return el ? el.getBoundingClientRect() : null;
+        } catch (_) {
+          return null;
+        }
+      })();
+      const cands = [...d.querySelectorAll('[contenteditable="true"], [role="textbox"], textarea')].filter(
+        (x) => x.isConnected && x.offsetParent !== null
+      );
+      if (cands.length === 1) return cands[0];
+      let best = null;
+      let bestD = Infinity;
+      for (const c of cands) {
+        try {
+          const r = c.getBoundingClientRect();
+          const dd = r0 ? Math.abs(r.top - r0.top) + Math.abs(r.left - r0.left) : 0;
+          if (dd < bestD) {
+            bestD = dd;
+            best = c;
+          }
+        } catch (_) {}
+      }
+      if (best && bestD < 120) return best;
+    } catch (_) {}
+    return el;
+  }
+
+  // 写入是否真的成功：**先严格比对，再宽容确认**。
+  //
+  // ⚠️ 为什么要第二层：真实编辑器会把内容渲染到子节点/容器里，我们"找回活节点"时
+  //    可能拿到的是**容器**（它的文本还含工具栏等）→ 严格比对失败 → 明明写对了却报失败，
+  //    AI 于是反复重试，最后彻底迷失（用户反馈的"开始成功、后来不成功"就有这一份）。
+  //    所以再看一眼：**期望的每一行是不是都出现在目标元素或其容器里**。
+  function verifyAround(el, v) {
+    if (verifyFilled(el, v)) return true;
+    const want = String(v || "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (!want.length) return true;
+    let cur = el;
+    for (let i = 0; i < 3 && cur; i++) {
+      let hay = "";
+      try {
+        hay = readEditableText(cur);
+      } catch (_) {}
+      if (!hay && cur.textContent) hay = cur.textContent;
+      const flat = String(hay).replace(/\s+/g, " ");
+      if (want.every((l) => flat.includes(l.replace(/\s+/g, " ")))) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
   // 聚焦元素（跨 iframe 时还要把 iframe 自己的窗口也聚焦，否则 execCommand 会失败）
   function focusEl(el) {
     const doc = el.ownerDocument || document;
@@ -1773,6 +1917,17 @@
         el.focus();
       } catch (_) {}
     }
+  }
+
+  // 拟人打字用的等待：
+  // ⚠️ 以前这里是 autoSleep()，而它的定义随"页面侧旧自动化循环"一起被删掉了 ——
+  //    结果 type / fill human:true 这条路一调用就抛 "autoSleep is not defined"，
+  //    也就是**逐字输入完全不通**（测试只用一次性 fill 所以一直没暴露，用户却会遇到）。
+  //    这里补一个本地的 sleep：忙时（用户在点停止/页面在跳转）也能提前结束。
+  function autoSleep(ms) {
+    const n = Math.max(0, Number(ms) || 0);
+    if (!n) return Promise.resolve();
+    return new Promise((resolve) => setTimeout(resolve, n));
   }
 
   // 在富文本里插入一个"真正的换行"：
@@ -1808,6 +1963,17 @@
     focusEl(el);
     // 选中全部既有内容，随后插入会替换掉它
     selectAllIn(el);
+
+    // 受控编辑器会监听 beforeinput（并常常 preventDefault 自己接管），先给它一次机会
+    try {
+      const be = new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: text,
+      });
+      if (!el.dispatchEvent(be)) return false;
+    } catch (_) {}
 
     const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
     // 单行：一次插入就够（快）
@@ -1892,6 +2058,23 @@
     let nextThink = Math.round(rand(prof.thinkEvery[0], prof.thinkEvery[1]));
 
     for (let i = 0; i < chars.length; i++) {
+      // ★ 每个字符之前都确认"节点还活着"。
+      //   真实编辑器（ProseMirror / Slate / Quill / Lexical）经常在每次输入后重建 DOM，
+      //   旧引用会 detached —— 继续往它上面敲就等于对着空气打字：
+      //   表现正是"有时能输入、有时写不进去、还越试越乱"（用户反馈的时好时坏）。
+      const liveEl = liveEditable(el, doc);
+      if (liveEl && liveEl !== el) {
+        el = liveEl;
+        // 换了新节点：焦点和"选区"都要重建一次（编辑器靠 mousedown 才认输入）
+        clickForFocus(el);
+        try {
+          selectAllIn(el);
+        } catch (_) {}
+        await autoSleep(60);
+      } else if (el && !el.isConnected) {
+        break; // 彻底找不回来了：别再空敲，交给上层回读与报错
+      }
+
       const ch = chars[i];
 
       // 换行：**按 Enter 处理**（以前给的是 KeyboardEvent({key:"\n"})，等于什么都没发生，
@@ -1966,8 +2149,55 @@
     } catch (_) {}
   }
 
+  // 写入失败的统一收尾。
+  //
+  // 除了说明行数（换行问题），还带**连续失败计数**：同一个输入框连续失败 2 次以上时，
+  // 明确告诉 AI"别再试这个编号了"，并给出换手段（find/a11y/截图、先 click、退到 type）。
+  // 这是针对用户反馈的"试了很多轮都不成、后来迷失方向"——反复重试同一个元素是最常见的死循环。
+  const editFailCounts = new Map();
+  function editKeyOf(el) {
+    try {
+      const label = el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.id || "";
+      return `${el.tagName.toLowerCase()}|${String(label).slice(0, 40)}|${(el.className || "").toString().slice(0, 40)}`;
+    } catch (_) {
+      return "unknown";
+    }
+  }
+  function noteEditFail(el, v, why) {
+    const wantLines = String(v || "").split("\n").length;
+    const gotLines = readEditableText(el).split("\n").length;
+    const key = editKeyOf(el);
+    const n = (editFailCounts.get(key) || 0) + 1;
+    editFailCounts.set(key, n);
+    const tried = n >= 2;
+    const hint =
+      (tried
+        ? `⚠️ 这个输入区域已经连续失败 ${n} 次 —— **不要再对同一个编号重复 fill/type 了**。` +
+          "先 {\"action\":\"find\",\"text\":\"…\"} 或 {\"action\":\"a11y\"} 重新看一遍页面（页面可能已经变了、" +
+          "或你点的和你想的不是同一个元素），必要时用 screenshot 看看实际长什么样；" +
+          "如果它确实是个刁钻的编辑器，先用 click 点它、再 type 逐字输入（可加 human:true）。"
+        : "如果这是富文本编辑器：先对该元素执行 click 让它获得焦点，再重试 fill。") +
+      (wantLines > 1
+        ? `（期望 ${wantLines} 行，实际读到 ${gotLines} 行 —— 换行没写进去；value 里要用 \\n）`
+        : "") +
+      " 若它在 iframe / shadow DOM 里，也先点一下再试；仍不行就用 extract 看它当前内容。";
+    return {
+      ok: false,
+      msg: `${why}「${clip(v, 30)}」` + (wantLines > 1 ? `（期望 ${wantLines} 行 / 实际 ${gotLines} 行）` : ""),
+      hint,
+      retrySameTarget: tried ? false : undefined,
+    };
+  }
+
   function fillPlainInput(el, text) {
     el.focus();
+    // 受控组件（React/Vue）会监听 beforeinput：先给它一次机会，它 preventDefault 就说明它自己管输入
+    let handled = false;
+    try {
+      const be = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text });
+      handled = !el.dispatchEvent(be);
+    } catch (_) {}
+    if (handled) return;
     try {
       const desc = Object.getOwnPropertyDescriptor(
         el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
@@ -2023,6 +2253,21 @@
 
   // ===== 动作执行 =====
   async function act(a) {
+    // ⚠️ 统一兜异常：以前内容脚本里抛异常时，注入结果会变成 undefined，
+    //    面板只能报"页面未响应动作"，完全看不出真实原因（排查很难，用户也只会觉得"没反应"）。
+    //    这里把错误原文带回去，AI 和日志里都能看到。
+    try {
+      return await actInner(a);
+    } catch (err) {
+      return {
+        ok: false,
+        msg: "动作执行时页面脚本出错：" + ((err && err.message) || err),
+        hint: "这多半是页面结构特殊（复杂编辑器/框架重渲染/跨域 iframe）。请先用 find 或 a11y 重新观察，必要时改用 type 逐字输入。",
+      };
+    }
+  }
+
+  async function actInner(a) {
     if (!a || typeof a !== "object") return { ok: false, msg: "动作无效" };
     const needTarget = ["click", "fill", "select", "check", "extract", "focus"].includes(a.action);
     let el = null;
@@ -2044,57 +2289,54 @@
       case "fill": {
         const v = a.value == null ? "" : String(a.value);
         el.scrollIntoView({ block: "center", behavior: "instant" });
+        // ⚠️ 先"真点一下"再写：很多编辑器（ProseMirror/Quill/Slate/Lexical）要 mousedown 才建选区，
+        //    只 focus() 的话内容会落进它看不见的地方 —— 这就是"有时写得进去有时不行"的主因。
+        clickForFocus(el);
+        await sleep(60);
+        // 记下"原地锚点"：编辑器常在输入后把可编辑节点整个换掉，
+        // 回读时靠这个容器才能找回**同一个**编辑器（而不是页面上别的输入框）
+        try {
+          el.__qnAnchor = el.parentElement || null;
+        } catch (_) {}
         // human:true → 不一次性写完，改成真人节奏逐字输入（用于有反自动化检测的站点）
         const human = a.human === true || a.human === "true" || a.typing === "human";
         if (human) {
           if (isRichText(el)) {
             try {
-              el.innerHTML = "";
+              const live0 = liveEditable(el);
+              live0.innerHTML = "";
             } catch (_) {}
           } else {
             fillPlainInput(el, "");
           }
           await typeIntoEditable(el, v, a);
-          if (verifyFilled(el, v)) {
+          const live = liveEditable(el);
+          if (verifyAround(live, v)) {
             return { ok: true, msg: `已按真人节奏输入「${clip(v, 30)}」（${charsOf(v)} 字符）` };
           }
-          return {
-            ok: false,
-            msg: `按真人节奏输入「${clip(v, 30)}」后没有读到内容`,
-            hint: "该元素可能不是可输入区域，或需要先 click 聚焦；也可能它确实抗拒逐字输入（那就用 fill 一次性写入）。",
-          };
+          return noteEditFail(live, v, "按真人节奏输入后没有读到内容");
         }
         if (isRichText(el)) {
           fillContentEditable(el, v);
         } else {
           fillPlainInput(el, v);
         }
-        // 回读验证：编辑器可能拒绝这次输入（比如它有自己的状态机）
-        if (!verifyFilled(el, v)) {
+        // 回读验证：编辑器可能拒绝这次输入，也可能把节点整个重建了（用活节点读）
+        let liveAfter = liveEditable(el);
+        if (!verifyAround(liveAfter, v)) {
           // 第二级兜底：逐字输入（走 keydown → insertText → keyup 事件流）
-          if (isRichText(el)) {
+          liveAfter = liveEditable(el);
+          if (isRichText(liveAfter)) {
             try {
-              el.innerHTML = "";
+              liveAfter.innerHTML = "";
             } catch (_) {}
-            await typeIntoEditable(el, v, a);
-            if (verifyFilled(el, v)) {
+            await typeIntoEditable(liveAfter, v, a);
+            liveAfter = liveEditable(liveAfter);
+            if (verifyAround(liveAfter, v)) {
               return { ok: true, msg: `已填入「${clip(v, 30)}」（逐字输入）` };
             }
           }
-          const wantLines = String(v || "").split("\n").length;
-          const gotLines = readEditableText(el).split("\n").length;
-          return {
-            ok: false,
-            msg:
-              `已尝试写入「${clip(v, 30)}」，但页面没有接受这次输入` +
-              (wantLines > 1 ? `（期望 ${wantLines} 行，实际读到 ${gotLines} 行 —— 换行没写进去）` : ""),
-            hint:
-              (wantLines > 1
-                ? "这是富文本编辑器且换行没生效：确认 value 里用的是 \\n；本扩展会按行插入真正的换行（Enter / insertParagraph）。"
-                : "如果这是富文本编辑器：先对该元素执行 click 让它获得焦点，再重试 fill；") +
-              "若它在 iframe / shadow DOM 里，也先点一下再试。仍不行就用 extract 看看它当前内容，" +
-              "必要时改用 type 逐字输入（要更慢更逼真可加 \"human\":true 与 \"speed\":\"slow\"）。",
-          };
+          return noteEditFail(liveAfter, v, "已尝试写入，但页面没有接受这次输入");
         }
         return {
           ok: true,
@@ -2108,18 +2350,22 @@
         const target = (a.target != null ? findByIdx(a.target) : null) || document.activeElement;
         if (!target) return { ok: false, msg: "没有可输入的目标元素" };
         target.scrollIntoView({ block: "center", behavior: "instant" });
+        try {
+          target.__qnAnchor = target.parentElement || null;
+        } catch (_) {}
+        // 同样先"真点一下"：逐字输入也要求编辑器先建立选区，否则按键流没人接
+        clickForFocus(target);
+        await sleep(60);
         if (isRichText(target)) {
           await typeIntoEditable(target, v, a);
         } else {
           fillPlainInput(target, "");
           await typeIntoEditable(target, v, a);
         }
-        if (!verifyFilled(target, v)) {
-          return {
-            ok: false,
-            msg: `逐字输入「${clip(v, 30)}」后没有读到内容`,
-            hint: "该元素可能不是可输入区域，请换用 fill，或先 click 让它聚焦。",
-          };
+        // 逐字输入后同样用"活着的那个节点"回读（编辑器可能重建了 DOM）
+        const liveType = liveEditable(target);
+        if (!verifyAround(liveType, v)) {
+          return noteEditFail(liveType, v, "逐字输入后没有读到内容");
         }
         return { ok: true, msg: `已逐字输入「${clip(v, 30)}」` };
       }
