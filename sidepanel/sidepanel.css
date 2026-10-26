@@ -615,6 +615,48 @@ select:focus {
   color: var(--text-faint);
   margin-top: 8px;
 }
+
+/* ===== 提问里附带的图片（截图/图片附件）：显示缩略图，点击看大图 ===== */
+.msg-text { display: block; }
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.msg-thumb {
+  max-width: 132px;
+  max-height: 92px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  cursor: zoom-in;
+  object-fit: cover;
+  transition: transform 0.12s;
+}
+.msg-thumb:hover { transform: scale(1.03); border-color: var(--accent); }
+
+/* 大图查看器 */
+.img-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(4, 6, 10, 0.9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  cursor: zoom-out;
+  padding: 18px;
+}
+.img-viewer.hidden { display: none !important; }
+.img-viewer img {
+  max-width: 96%;
+  max-height: 86vh;
+  border-radius: 10px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+}
+.img-viewer-tip { color: var(--text-faint); font-size: 12px; }
 /* meta 行：左边的来源说明 + 右边的复制按钮 */
 .msg .meta-row {
   display: flex;

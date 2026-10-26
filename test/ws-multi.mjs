@@ -174,6 +174,9 @@ async function script(panel, spec) {
       const flag = "__did_" + rule.when;
       if (rule.once && window[flag]) return [{ content: "已经做过了。" }];
       if (rule.once) window[flag] = true;
+      if (rule.raw) {
+        return [{ content: "好。\n```action\n" + rule.raw + "\n```" }];
+      }
       if (rule.click) {
         const m = new RegExp("\\[(\\d+)\\][^\\n]*" + rule.click).exec(all);
         return [{ content: "好。\n```action\n" + JSON.stringify({ action: "click", target: m ? Number(m[1]) : 0 }) + "\n```" }];
@@ -467,6 +470,81 @@ try {
     return { empty: !!e && getComputedStyle(e).display !== "none" };
   });
   check("移出后：回到自己的新对话页", afterEject.empty, JSON.stringify(afterEject));
+
+  // ============ ⑥ 输入框草稿：发出去的内容不该再冒出来 ============
+  // 用户报过："切换几个页面，刚才问 AI 的内容会显示在输入框里"
+  const pageE = await openPage("a.html");
+  const panelE = await openPanel(pageE);
+  await script(panelE, { rules: [{ when: "随便问问", text: "好的。" }] });
+  await say(panelE, "随便问问", pageE);
+  await sleep(2600);
+  const afterSend = await panelE.evaluate(() => document.getElementById("input").value);
+  check("发送后输入框是空的", afterSend === "", JSON.stringify(afterSend));
+
+  // 切去别的页再切回来（会触发一次"视图激活"，以前就会把草稿塞回来）
+  const pageF = await openPage("b.html");
+  await pageF.bringToFront();
+  await sleep(700);
+  await pageE.bringToFront();
+  await sleep(900);
+  const afterSwitch = await panelE.evaluate(() => document.getElementById("input").value);
+  check("切页再切回来，发过的那条不会再冒出来", afterSwitch === "", JSON.stringify(afterSwitch));
+
+  // 未发送的草稿仍然要保留（这是原本的好意：打了半句切走不丢）
+  await panelE.evaluate(() => {
+    document.getElementById("input").value = "打了半句没发";
+    document.getElementById("input").dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await pageF.bringToFront();
+  await sleep(600);
+  await pageE.bringToFront();
+  await sleep(900);
+  const keptDraft = await panelE.evaluate(() => document.getElementById("input").value);
+  check("没发送的草稿仍然跟着页面保留", keptDraft === "打了半句没发", JSON.stringify(keptDraft));
+
+  // ============ ⑦ 关掉临时页之后，不能一直报"目标标签页已关闭" ============
+  const pageG = await openPage("a.html");
+  const panelG = await openPanel(pageG);
+  await script(panelG, {
+    rules: [
+      { when: "开个临时页", once: true, newtab: `http://127.0.0.1:${PORT}/c.html` },
+      { when: "用完关掉它", once: true, raw: '{"action":"closetab"}' },
+      { when: "再点一下", once: true, click: "「计数按钮」" },
+    ],
+  });
+  await say(panelG, "开个临时页", pageG);
+  await sleep(3500);
+  await say(panelG, "用完关掉它", pageG);
+  await sleep(3000);
+  await say(panelG, "再点一下", pageG);
+  await sleep(3000);
+  const gText = await sessionText(panelG);
+  check(
+    "关掉临时页之后继续操作：不再误报「目标标签页已经被关闭了」",
+    !/目标标签页已经被关闭了/.test(gText.text),
+    JSON.stringify({ tail: gText.text.slice(-150) })
+  );
+  const gClicks = await pageG.evaluate(() => window.__clicks || 0);
+  check("关掉临时页后，原页面上的动作仍然真的执行了", gClicks > 0, `clicks=${gClicks}`);
+
+  // ============ ⑧ 自动模式下不该出现"等着点"的执行/取消卡片 ============
+  const pageH = await openPage("a.html");
+  const panelH = await openPanel(pageH);
+  await script(panelH, { rules: [{ when: "自动开个新页", once: true, newtab: `http://127.0.0.1:${PORT}/b.html` }] });
+  await say(panelH, "自动开个新页", pageH);
+  await sleep(2500);
+  const pendingMid = await panelH.evaluate(() => document.querySelectorAll(".tool-card.pending").length);
+  await sleep(2000);
+  const pendingEnd = await panelH.evaluate(() => ({
+    pending: document.querySelectorAll(".tool-card.pending").length,
+    okBtns: [...document.querySelectorAll(".tool-card .ok-btn")].filter((b) => b.offsetParent !== null).length,
+  }));
+  check("自动模式下不出现等待点击的卡片（中途）", pendingMid === 0, `pending=${pendingMid}`);
+  check(
+    "自动模式下不出现等待点击的卡片（结束后仍没有可点的执行按钮）",
+    pendingEnd.pending === 0 && pendingEnd.okBtns === 0,
+    JSON.stringify(pendingEnd)
+  );
 
   if (ERRORS.length) console.log("[面板报错] " + ERRORS.slice(0, 4).join(" | "));
   check("面板没有抛异常", ERRORS.length === 0, `${ERRORS.length} 条`);

@@ -14,6 +14,9 @@ import {
 import {
   parseSkillMd,
   stringifySkillMd,
+  // 新格式：元数据放在 HTML 注释里（导出/复制用），导入时两种格式都认
+  stringifySkillDoc,
+  stripSkillMeta,
   makeSkill,
   fetchMarketIndex,
   fetchSkillMd,
@@ -30,6 +33,24 @@ const statusEl = $("marketStatus");
 let skills = {};
 let market = null;
 let marketSource = "";
+
+// ===== 两个市场（并列，共用同一套展示框架）=====
+//   official = 官方市场（GitHub，我维护）        user = 用户市场（官网接口，社区投稿）
+const USER_MARKET_DEFAULT = "https://qingniao.gt.tc/api/market.php";
+const PAGE_SIZE = 12;
+let marketTab = "official";                       // 当前这一栏
+const marketState = { official: null, user: null }; // 各自的目录（切换时共用下面那套渲染）
+const marketPage = { official: 1, user: 1 };
+// market 变量本身在原文件上方已声明 = 当前这一栏的目录（沿用旧命名，改动最小）
+
+const currentMarket = () => marketState[marketTab];
+const currentSource = () => {
+  if (marketTab === "user") return ($("userSourceInput").value || "").trim() || USER_MARKET_DEFAULT;
+  return ($("sourceInput").value || "").trim() || DEFAULT_MARKET_REPO;
+};
+const isUserMarket = () => marketTab === "user";
+const pageOf = () => marketPage[marketTab] || 1;
+const setPage = (n) => (marketPage[marketTab] = Math.max(1, n));
 let editingId = null;
 
 function setStatus(msg, kind) {
@@ -81,49 +102,106 @@ function bindNav() {
 function bindMarket() {
   $("fetchBtn").addEventListener("click", () => fetchMarket({}));
   $("resetSourceBtn").addEventListener("click", () => {
-    $("sourceInput").value = DEFAULT_MARKET_REPO;
+    if (isUserMarket()) $("userSourceInput").value = USER_MARKET_DEFAULT;
+    else $("sourceInput").value = DEFAULT_MARKET_REPO;
     fetchMarket({});
   });
-  $("marketSearch").addEventListener("input", renderMarket);
+  $("marketSearch").addEventListener("input", () => {
+    setPage(1);
+    renderMarket();
+  });
+
+  // 两个市场**并列**：切换只换数据源，展示框架（列表/搜索/分页）是同一套
+  const switchTab = (tab) => {
+    if (tab !== "official" && tab !== "user") return;
+    marketTab = tab;
+    market = currentMarket();
+    $("tabOfficial").classList.toggle("active", tab === "official");
+    $("tabUser").classList.toggle("active", tab === "user");
+    $("officialSourceField").classList.toggle("hidden", tab !== "official");
+    $("userSourceField").classList.toggle("hidden", tab !== "user");
+    $("userMarketNote").classList.toggle("hidden", tab !== "user");
+    $("marketSearch").value = "";
+    setPage(1);
+    syncMarketMeta();
+    renderMarket();
+    // 这一栏还没拉过 → 自动拉一次（静默，不打扰）
+    if (!currentMarket()) fetchMarket({ silent: true });
+  };
+  $("tabOfficial").addEventListener("click", () => switchTab("official"));
+  $("tabUser").addEventListener("click", () => switchTab("user"));
+}
+
+function syncMarketMeta() {
+  const m = currentMarket();
+  const label = isUserMarket() ? "用户市场" : "官方市场";
+  if (m) {
+    $("marketMeta").textContent = `${label}：已同步 ${m.count} 个技能 · 来源 ${m.label}`;
+  } else {
+    $("marketMeta").textContent = `${label}：尚未同步（点右上角「获取技能」）`;
+  }
+  // 两个按钮上顺便显示各自的数量，一眼看出哪边有新东西
+  const n1 = marketState.official ? marketState.official.count : null;
+  const n2 = marketState.user ? marketState.user.count : null;
+  $("numOfficial").textContent = n1 == null ? "" : `(${n1})`;
+  $("numUser").textContent = n2 == null ? "" : `(${n2})`;
 }
 
 async function fetchMarket({ silent } = {}) {
-  const input = $("sourceInput").value.trim() || DEFAULT_MARKET_REPO;
-  marketSource = input;
+  const tab = marketTab;
+  const input = currentSource();
+  if (tab === "official") marketSource = input;
   if (!silent) {
     $("marketMeta").textContent = "正在获取…";
-    setStatus("正在从仓库获取技能目录…");
+    setStatus("正在获取技能目录…");
   }
   try {
-    market = await fetchMarketIndex(input);
-    await saveMarketSettings({
-      source: input,
-      repo: market.repo,
-      lastSyncAt: Date.now(),
-      lastCount: market.count,
-      lastError: "",
-    });
-    $("marketMeta").textContent = `已同步 ${market.count} 个技能 · ${fmtTime(Date.now())} · 来源：${market.label}`;
+    const idx = await fetchMarketIndex(input);
+    marketState[tab] = idx;
+    if (tab === marketTab) market = idx;
+    const patch =
+      tab === "user"
+        ? { userSource: input, userLastSyncAt: Date.now(), userLastCount: idx.count, userLastError: "" }
+        : { source: input, repo: idx.repo, lastSyncAt: Date.now(), lastCount: idx.count, lastError: "" };
+    await saveMarketSettings(patch);
+    setPage(1);
+    syncMarketMeta();
     renderMarket();
-    if (!silent) setStatus(`获取成功：${market.count} 个技能（${market.label}）`, "ok");
+    if (!silent) setStatus(`获取成功：${idx.count} 个技能（${idx.label}）`, "ok");
   } catch (err) {
-    market = null;
-    await saveMarketSettings({ source: input, lastError: String((err && err.message) || err) });
-    $("marketMeta").textContent = "获取失败：" + ((err && err.message) || err);
+    marketState[tab] = null;
+    if (tab === marketTab) market = null;
+    const msg = String((err && err.message) || err);
+    await saveMarketSettings(tab === "user" ? { userSource: input, userLastError: msg } : { source: input, lastError: msg });
+    setPage(1);
+    syncMarketMeta();
     renderMarket();
-    if (!silent) setStatus("获取失败：" + ((err && err.message) || err), "err");
+    if (!silent) setStatus("获取失败：" + msg, "err");
   }
 }
 
 function renderMarket() {
   const box = $("marketList");
+  const pager = $("marketPager");
   box.innerHTML = "";
+  market = currentMarket();
+  if (pager) pager.innerHTML = "";
   if (!market) {
-    box.appendChild(el("div", "empty", "还没有技能列表。点上方的「获取技能」从仓库拉取，或换一个来源地址。"));
+    if (pager) pager.classList.add("hidden");
+    box.appendChild(
+      el(
+        "div",
+        "empty",
+        isUserMarket()
+          ? "还没拉取用户市场。点右上角「获取技能」，或先确认官网接口地址对不对。"
+          : "还没有技能列表。点右上角的「获取技能」从仓库拉取，或换一个来源地址。"
+      )
+    );
     return;
   }
   const q = $("marketSearch").value.trim().toLowerCase();
-  const list = market.index.skills.filter((s) => {
+  const all = market.index.skills;
+  const list = all.filter((s) => {
     if (!q) return true;
     return (
       s.id.toLowerCase().includes(q) ||
@@ -133,10 +211,43 @@ function renderMarket() {
     );
   });
   if (!list.length) {
+    if (pager) pager.classList.add("hidden");
     box.appendChild(el("div", "empty", q ? "没有匹配的技能。" : "这个市场里还没有技能。"));
     return;
   }
-  for (const m of list) box.appendChild(marketCard(m));
+
+  // ---- 分页（两个市场共用这一套）----
+  const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+  if (pageOf() > pages) setPage(pages);
+  const page = pageOf();
+  const from = (page - 1) * PAGE_SIZE;
+  for (const m of list.slice(from, from + PAGE_SIZE)) box.appendChild(marketCard(m));
+
+  if (pager) {
+    pager.classList.remove("hidden");
+    const mkBtn = (text, targetPage, disabled, active) => {
+      const b = document.createElement("button");
+      b.className = "mk-page" + (active ? " active" : "");
+      b.textContent = text;
+      b.disabled = !!disabled;
+      b.addEventListener("click", () => {
+        setPage(targetPage);
+        renderMarket();
+        $("marketList").scrollIntoView({ block: "nearest", behavior: "smooth" });
+      });
+      return b;
+    };
+    const info = document.createElement("span");
+    info.className = "mk-page-info";
+    info.textContent = `第 ${page} / ${pages} 页 · 共 ${list.length} 个`;
+    pager.appendChild(mkBtn("‹ 上一页", page - 1, page <= 1, false));
+    // 页码：当前页附近最多 7 个
+    const start = Math.max(1, Math.min(page - 3, pages - 6));
+    const end = Math.min(pages, start + 6);
+    for (let i = start; i <= end; i++) pager.appendChild(mkBtn(String(i), i, false, i === page));
+    pager.appendChild(mkBtn("下一页 ›", page + 1, page >= pages, false));
+    pager.appendChild(info);
+  }
 }
 
 function marketCard(m) {
@@ -152,6 +263,9 @@ function marketCard(m) {
   card.appendChild(el("p", "card-desc", m.description || "（作者没有写说明）"));
 
   const meta = el("div", "card-meta");
+  // 来源徽标：一眼分清"官方维护"和"社区投稿（未官方审核）"
+  const fromUser = isUserMarket() || m.market === "user";
+  meta.appendChild(el("span", "chip " + (fromUser ? "chip-user" : "chip-official"), fromUser ? "用户投稿 · 未审核" : "官方"));
   if (m.author) meta.appendChild(el("span", "chip", "作者 " + m.author));
   for (const t of m.tags) meta.appendChild(el("span", "chip", t));
   card.appendChild(meta);
@@ -225,6 +339,7 @@ async function installMarketSkill(m, btn) {
     const skill = makeSkill({ meta, body, fallbackId: m.id });
     if (!skill.id) throw new Error("技能缺少 name 字段");
     const prev = skills[skill.id] || {};
+    const fromUser = isUserMarket() || m.market === "user";
     const saved = await upsertSkill({
       ...skill,
       title: skill.title || m.title,
@@ -232,15 +347,24 @@ async function installMarketSkill(m, btn) {
       icon: skill.icon || m.icon,
       tags: skill.tags && skill.tags.length ? skill.tags : m.tags,
       source: "market",
-      enabled: prev.enabled !== false,
+      // ⚠️ 用户市场是社区投稿（审核过但不是官方出品）→ **装好默认停用**，
+      //    让用户先看一眼正文、自己决定要不要打开（免得直接照着可疑指令去操作页面）。
+      enabled: fromUser ? false : prev.enabled !== false,
+      market: fromUser ? "user" : "official",
+      marketAuthor: m.author || "",
       marketUrl: url,
-      marketSource: marketSource,
+      marketSource: marketSource || currentSource(),
       marketVersion: m.version,
     });
     skills = await loadSkills();
     renderMarket();
     renderMine();
-    setStatus(`已安装「${saved.title}」v${saved.version}，回侧栏点「技能」即可用`, "ok");
+    setStatus(
+      fromUser
+        ? `已安装「${saved.title}」v${saved.version}（用户投稿，**先停用**：到「我的技能」里看一遍正文再打开）`
+        : `已安装「${saved.title}」v${saved.version}，回侧栏点「技能」即可用`,
+      "ok"
+    );
   } catch (err) {
     setStatus("安装失败：" + ((err && err.message) || err), "err");
   } finally {
@@ -255,6 +379,8 @@ async function installMarketSkill(m, btn) {
 function bindMine() {
   $("newSkillBtn").addEventListener("click", startNewSkill);
   $("exportAllBtn").addEventListener("click", exportAll);
+  const cleanup = $("cleanupMetaBtn");
+  if (cleanup) cleanup.addEventListener("click", cleanupSkillMeta);
 }
 
 function renderMine() {
@@ -316,6 +442,12 @@ function mineCard(s) {
   exp.addEventListener("click", () => downloadSkill(s));
   actions.appendChild(exp);
 
+  // 投稿到用户市场（官网接口，免注册）
+  const submit = el("button", "tiny", "投稿到用户市场");
+  submit.title = "把这一个技能提交到官网的用户市场（会先进待审核队列）";
+  submit.addEventListener("click", () => submitSkillToUserMarket(s, submit));
+  actions.appendChild(submit);
+
   const del = el("button", "tiny danger", "删除");
   del.addEventListener("click", async () => {
     if (!confirm(`删除技能「${s.title || s.id}」？只影响本机。`)) return;
@@ -337,6 +469,68 @@ async function exportAll() {
   if (!list.length) return setStatus("没有可导出的技能", "err");
   for (const s of list) downloadSkill(s);
   setStatus(`已导出 ${list.length} 个 .md 文件`, "ok");
+}
+
+// ---------- 投稿到用户市场（插件内提交）----------
+// 把技能 POST 到官网的 submit.php（免注册，返回 editToken 供以后改/撤）。
+// 提交成功只是进了**待审核队列** —— 审核通过才会出现在用户市场里。
+async function submitSkillToUserMarket(s, btn) {
+  const src = ($("userSourceInput").value || "").trim() || USER_MARKET_DEFAULT;
+  const submitUrl = src.replace(/market\.php.*$/i, "submit.php");
+  if (!/^https?:\/\//i.test(submitUrl)) return setStatus("用户市场地址不对，先在「用户市场」那一栏填好接口地址", "err");
+  if (!confirm(
+    `把「${s.title || s.id}」提交到用户市场？\n\n` +
+    `会发到：${submitUrl}\n` +
+    `提交后进入待审核队列；通过后会出现在用户市场（其他人能装）。\n` +
+    `确认内容是原创、且不含违规或可能造成损失的操作吗？`
+  )) return;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "提交中…";
+  }
+  setStatus("正在提交到用户市场…");
+  try {
+    const payload = {
+      slug: s.id,
+      title: s.title || s.id,
+      description: s.description || "",
+      version: s.version || "1.0.0",
+      author: s.author || "",
+      tags: Array.isArray(s.tags) ? s.tags.join(",") : s.tags || "",
+      icon: s.icon || "",
+      body: stripSkillMeta(s.body || "").trim(),
+      from: "plugin",
+      agree: true,
+    };
+    const res = await fetch(submitUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!j || !j.ok) throw new Error((j && j.error) || ("HTTP " + res.status));
+    let tip = j.updated ? "已更新你之前投的那条，重新进入待审核" : "已提交，等待审核";
+    if (j.editToken) {
+      try {
+        await navigator.clipboard.writeText(j.editToken);
+        tip += "（editToken 已复制到剪贴板，请收好：凭它改/撤投稿）";
+      } catch (_) {
+        tip += "（editToken：" + j.editToken + " —— 请自己保存）";
+      }
+    }
+    await upsertSkill({ id: s.id, marketSubmit: { at: Date.now(), status: j.status || "pending", url: submitUrl } });
+    skills = await loadSkills();
+    renderMine();
+    setStatus("✅ " + tip, "ok");
+  } catch (err) {
+    setStatus("投稿失败：" + ((err && err.message) || err), "err");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "投稿到用户市场";
+    }
+  }
 }
 
 // ---------- 编辑器 ----------
@@ -384,19 +578,22 @@ function editorMeta() {
 
 function editorMarkdown() {
   const meta = editorMeta();
-  const body = $("edBody").value;
+  // 编辑框里若被粘贴了一整份 SKILL.md（含元数据块），先剥掉 —— 元数据走表单字段
+  const body = stripSkillMeta($("edBody").value);
   if (!body.trim()) return "";
   const cleaned = {};
   for (const [k, v] of Object.entries(meta)) {
     if (Array.isArray(v) ? v.length : v) cleaned[k] = v;
   }
-  return stringifySkillMd(cleaned, body);
+  // 导出/复制用**新格式**（HTML 注释装元数据）：Markdown 渲染不显示，也不会被语法吃掉
+  return stringifySkillDoc(cleaned, body);
 }
 
 function renderEditorPreview() {
   const md = editorMarkdown();
+  // 新格式的元数据在 HTML 注释里，预览时再剥一次，保证不显示出来
   $("edPreview").innerHTML = md
-    ? renderMarkdown(md.replace(/^---[\s\S]*?---\r?\n?/, ""))
+    ? renderMarkdown(stripSkillMeta(md))
     : '<p class="muted">（左边写点什么，这里就会显示效果）</p>';
   const meta = editorMeta();
   const missing = [];
@@ -442,9 +639,54 @@ function startNewSkill() {
   setStatus("在下面写一份新技能", "");
 }
 
+// 一键清理：把"正文里混进元数据块"的历史脏数据洗干净
+// （以前用带 BOM 的文件导入时，整块 frontmatter 会被当成正文存下来）
+async function cleanupSkillMeta() {
+  skills = await loadSkills();
+  const fixed = [];
+  for (const s of Object.values(skills)) {
+    const raw = String(s.body || "");
+    const clean = stripSkillMeta(raw).trim();
+    if (clean !== raw.trim()) {
+      await upsertSkill({ ...s, body: clean });
+      fixed.push(s.title || s.id);
+    }
+  }
+  skills = await loadSkills();
+  renderMine();
+  renderEditorPreview();
+  if (!fixed.length) return setStatus("没有需要清理的技能（正文都是干净的）", "");
+  setStatus(`已清理 ${fixed.length} 个技能正文里的元数据残留：${fixed.join("、")}`, "ok");
+}
+
 async function saveFromEditor() {
-  const meta = editorMeta();
-  const body = $("edBody").value.trim();
+  let meta = editorMeta();
+
+  // 编辑框里可能被粘贴了一整份 SKILL.md（元数据块 + 正文）——
+  // 保存前把元数据剥出来：**只把缺的字段补上**（不覆盖你已经填/改过的），正文只留正文。
+  // 这样既不会把元数据存成正文，也不会出现"两份 frontmatter"越改越乱。
+  const rawBody = $("edBody").value;
+  const parsed = parseSkillMd(rawBody);
+  if (parsed.form !== "none" && parsed.body.trim()) {
+    const fill = (key, elId) => {
+      const v = parsed.meta[key];
+      const val = Array.isArray(v) ? v.join(", ") : v;
+      if (val && !$(elId).value.trim()) {
+        $(elId).value = String(val);
+      }
+    };
+    fill("name", "edId");
+    fill("title", "edTitle");
+    fill("description", "edDesc");
+    fill("version", "edVersion");
+    fill("author", "edAuthor");
+    fill("tags", "edTags");
+    fill("icon", "edIcon");
+    $("edBody").value = parsed.body; // 编辑框里也立刻变干净
+    meta = editorMeta();
+  }
+  const body = stripSkillMeta($("edBody").value).trim();
+
   if (!meta.name) return setStatus("请填写技能 id", "err");
   if (!/^[a-z0-9][a-z0-9-]*$/.test(meta.name)) {
     return setStatus("技能 id 只能用小写字母、数字和连字符（例如 my-skill）", "err");
@@ -611,10 +853,11 @@ function parseImportedSkill(text, filename) {
     return out;
   }
 
-  // ② SKILL.md（有 frontmatter 走标准解析；没有就用文件名兜底）
+  // ② SKILL.md：新格式（HTML 注释装元数据）与老格式（--- frontmatter）都认；
+//    两种都没有就用文件名兜底。正文一律再剥一次元数据（双保险，免得脏数据混进来）。
   const { meta, body } = parseSkillMd(src);
   const hasFm = !!(meta && (meta.name || meta.title));
-  const mdBody = String(body || "").trim();
+  const mdBody = stripSkillMeta(String(body || "")).trim();
   if (!mdBody) throw new Error("没有正文内容");
 
   const id = slugifyId(meta.name || meta.title) || slugifyId(filename || "", { fromFilename: true });
@@ -629,7 +872,10 @@ function parseImportedSkill(text, filename) {
       author: String(meta.author || "").trim(),
       tags: Array.isArray(meta.tags) ? meta.tags.map(String) : [],
       icon: String(meta.icon || "").trim(),
-      body: text,
+      // ⚠️ 这里必须是**剥掉元数据块之后的正文**（mdBody）。
+      //    以前这里写的是 `text`（就是文件全文）—— 于是导入进来的技能正文里一直带着元数据块，
+      //    在编辑框里能看见、再保存就变成两份元数据（用户报的就是这条，测试也抓到了）。
+      body: mdBody,
       ...(hasFm ? {} : { note: "这份文件没有 frontmatter，标题/说明是从正文和文件名里推出来的" }),
     },
   ];
@@ -810,7 +1056,9 @@ function downloadText(filename, text) {
 }
 
 function skillMarkdown(skill) {
-  return stringifySkillMd(
+  // 导出用**新格式**：元数据在 HTML 注释里 —— 打开看是正常的 Markdown（注释不显示），
+  // 导入时又能把这几个字段自动填回表单
+  return stringifySkillDoc(
     {
       name: skill.id,
       title: skill.title,
@@ -841,9 +1089,9 @@ function downloadSkill(skill) {
   const ms = await loadMarketSettings();
   marketSource = ms.source || DEFAULT_MARKET_REPO;
   $("sourceInput").value = marketSource;
-  $("marketMeta").textContent = ms.lastSyncAt
-    ? `上次同步：${fmtTime(ms.lastSyncAt)}（${ms.lastCount || 0} 个技能）`
-    : "尚未同步，点「获取技能」从仓库拉取";
+  $("userSourceInput").value = ms.userSource || USER_MARKET_DEFAULT;
+  $("userMarketNote").classList.add("hidden"); // 默认在"官方市场"那一栏
+  syncMarketMeta();
   renderMine();
   renderMarket();
 

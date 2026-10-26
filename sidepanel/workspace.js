@@ -115,6 +115,58 @@ export function estimateMessages(messages) {
   return total;
 }
 
+// ===== 消息里的附带图片（截图/图片附件）=====
+//
+// 需求（用户）：侧栏里"我的提问附带的截图"要**显示出来**、**点击能看**、
+// 用 base64 存本地、并且**随会话一起删除**。
+// 实现：图片就存在那条消息的 attachments 里（base64）→ 重绘、切页、重开侧栏都还在 ✓，
+//       会话被删除/被历史裁剪时它跟着消失 ✓ 不留孤儿数据。
+function renderMsgImages(box, images) {
+  const list = (images || []).filter((a) => a && a.kind === "image" && a.dataUrl);
+  if (!list.length || !box) return;
+  const wrap = document.createElement("div");
+  wrap.className = "msg-images";
+  for (const a of list) {
+    const img = document.createElement("img");
+    img.className = "msg-thumb";
+    img.src = a.dataUrl;
+    img.alt = a.name || "图片";
+    img.title = (a.name || "图片") + "（点一下看大图）";
+    img.loading = "lazy";
+    wrap.appendChild(img);
+  }
+  box.appendChild(wrap);
+}
+
+// 点缩略图 → 全屏看大图（点任意处或按 Esc 关闭）
+function openImageViewer(src, name) {
+  let box = document.getElementById("imgViewer");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "imgViewer";
+    box.className = "img-viewer hidden";
+    box.innerHTML = '<img alt="" /><span class="img-viewer-tip">点任意处或按 Esc 关闭</span>';
+    box.addEventListener("click", () => box.classList.add("hidden"));
+    document.body.appendChild(box);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") box.classList.add("hidden");
+    });
+  }
+  const img = box.querySelector("img");
+  img.src = src;
+  img.alt = name || "";
+  box.classList.remove("hidden");
+}
+
+// 事件委托：任何 .msg-thumb 点一下都打开大图（气泡是随时重建的，别挂单个监听器）
+document.addEventListener("click", (ev) => {
+  const t = ev.target && ev.target.closest ? ev.target.closest(".msg-thumb") : null;
+  if (!t || !t.src) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  openImageViewer(t.src, t.alt);
+});
+
 // ===== 标签页基础工具 =====
 
 export async function describeTab(tabId) {
@@ -139,9 +191,20 @@ async function pageUrlOf(tabId) {
 }
 
 // 动作前校验目标页：还在不在？还是不是同一个页面？
+//
+// ⚠️ 两个"用户报过"的坑：
+//   ① `describeTab` 只要 `chrome.tabs.get` 失败一次就返回 null ✗ —— 而"一时读不到"
+//      （正在跳转/重载、标签页被浏览器临时回收）是常态 ✗，直接判死会误报"目标标签页已关闭"；
+//   ② 判定"死了"之后就直接报错 ✗ —— 其实工作区里往往还有别的活页 ✓。
+//   所以：先重试几次 + 重读工作区列表 ✓；真不在了，如果还有别的活页就**自动换目标继续** ✓，
+//   确实一个活页都没有才报错，而且文案说真话（"读不到" 与 "确实被关" 分开）。
 async function preflightTarget(tabId, expectUrl) {
   const expect = String(expectUrl || "");
-  const tab = await describeTab(tabId);
+  let tab = null;
+  for (let attempt = 0; attempt < 3 && !tab; attempt++) {
+    tab = await describeTab(tabId);
+    if (!tab) await sleepMs(220);
+  }
   if (!tab) return { dead: true };
   if (!/^https?:/i.test(expect)) return { ok: true, tab };
   const liveUrl = await pageUrlOf(tabId);
@@ -416,7 +479,7 @@ export class WorkspaceRuntime {
     for (const m of this.session.messages) {
       if (m.isActionResult) continue;
       if (m.role === "user") {
-        this.createUserBubble(m.content, { attachNote: m.attachNote });
+        this.createUserBubble(m.content, { attachNote: m.attachNote, images: m.attachments });
       } else if (m.role === "assistant") {
         const ui = this.createAssistantBubble();
         if (m.reasoning) ui.setThinking(m.reasoning, { streaming: false, open: false });
@@ -440,7 +503,12 @@ export class WorkspaceRuntime {
     this.emptyHintEl.style.display = "none";
     const div = document.createElement("div");
     div.className = "msg user";
-    div.textContent = text;
+    const textSpan = document.createElement("span");
+    textSpan.className = "msg-text";
+    textSpan.textContent = text;
+    div.appendChild(textSpan);
+    // 附带截图：**显示出来**（缩略图，点开能看大图）
+    renderMsgImages(div, opts.images);
     if (opts.attachNote) {
       const note = document.createElement("span");
       note.className = "attach-note";
@@ -1524,7 +1592,11 @@ export class WorkspaceRuntime {
         if (this.ws.rootTabId === wantId && this.ws.tabIds.length) this.ws.rootTabId = this.ws.tabIds[0];
         this.ctx.persist();
         this.ctx.renderWsBar();
-        return { ok: true, msg: `已关闭临时标签页 id=${wantId}${t && t.title ? `「${t.title.slice(0, 24)}」` : ""}` };
+        return {
+          ok: true,
+          closedTabId: wantId,
+          msg: `已关闭临时标签页 id=${wantId}${t && t.title ? `「${t.title.slice(0, 24)}」` : ""}`,
+        };
       } catch (err) {
         return { ok: false, msg: "关闭标签页失败：" + ((err && err.message) || err) };
       }
@@ -1912,9 +1984,19 @@ export class WorkspaceRuntime {
 // "真实请求很长、但界面上只需一句话"的情况），否则就是用户自己打的字。
     // 注意：存进会话的仍然是完整的 text（模型需要看到完整指令）。
     const displayText = opts.displayText || text || "（附件内容）";
-    this.createUserBubble(displayText, { attachNote });
+    // 图片**存进这条消息**（base64，就在本地会话里）：这样重开侧栏、切页回来都还能看到，
+    // 而且会话被删除时它跟着一起消失（不会留孤儿数据）。
+    const keepImages = sentAttachments
+      .filter((a) => a.kind === "image" && a.dataUrl)
+      .map((a) => ({ kind: "image", name: a.name || "图片", dataUrl: a.dataUrl }));
+    this.createUserBubble(displayText, { attachNote, images: keepImages });
 
-    this.session.messages.push({ role: "user", content: text || displayText, attachNote });
+    this.session.messages.push({
+      role: "user",
+      content: text || displayText,
+      attachNote,
+      attachments: keepImages.length ? keepImages : undefined,
+    });
     if (this.session.messages.filter((m) => !m.isActionResult).length === 1) {
       this.session.title = (displayText || "对话").slice(0, 30);
     }
@@ -1947,12 +2029,39 @@ export class WorkspaceRuntime {
       }
       const pre = await preflightTarget(tabId, snapshot?.url || "");
       if (pre.dead) {
-        return {
-          cardNote: "目标标签页已被关闭",
-          modelNote:
-            "【动作执行结果】未执行：目标标签页已经被关闭了。" +
-            "不要继续使用旧编号。请先用 navigate 打开目标网址，或询问用户要打开哪个页面。",
-        };
+        // 目标读不到：先重读一遍工作区列表再试（别的实例可能刚把页并进来/换过 id）
+        if (this.ctx.reloadWorkspaces) await this.ctx.reloadWorkspaces();
+        const pre2 = await preflightTarget(tabId, snapshot?.url || "");
+        if (pre2.dead) {
+          const alive = await this.ctx.getAliveTabs(this);
+          const next = alive.find((t) => t.id !== tabId);
+          if (next) {
+            // 还有别的活页 → 自己换过去继续干，别拿"已关闭"把整轮卡死
+            const old = tabId;
+            tabId = next.id;
+            try {
+              targetTab = await chrome.tabs.get(tabId);
+            } catch (_) {
+              targetTab = null;
+            }
+            snapshot = await getPageSnapshot(tabId);
+            this.targetPageLabel = (snapshot?.title || next.title || "").slice(0, 42);
+            return {
+              cardNote: "目标页换了：原来那页读不到了",
+              modelNote:
+                `【动作执行结果】未执行：原来的目标页（id=${old}）现在读不到了（可能已关闭或在跳转）——` +
+                `已自动把目标换成 id=${tabId}「${(next.title || next.url || "未命名").slice(0, 30)}」。` +
+                "元素编号已重新分配，请依据下面最新的元素列表重新决定下一步；如果要操作别的页，动作里带上 \"tab\":<id>。",
+            };
+          }
+          return {
+            cardNote: "目标页读不到了",
+            modelNote:
+              `【动作执行结果】未执行：目标页（id=${tabId}）现在读不到 —— 可能它真的被关闭了，` +
+              "也可能正在跳转/重载。请先用 {\"action\":\"newtab\",\"url\":\"…\"} 或 navigate 打开目标网址；" +
+              "如果只是跳转，先 {\"action\":\"wait\",\"ms\":1500} 再观察一次。",
+          };
+        }
       }
       if (pre.changed) {
         return {
@@ -2248,11 +2357,15 @@ export class WorkspaceRuntime {
           continue;
         }
 
+        // 自动模式：卡片**直接进入执行中**，压根不显示"执行/取消"按钮
+        // （用户报过：明明开了自动执行，切换标签页这类调用还是弹按钮等着点 ✗）
+        const autoNow = this.ctx.toggleState().auto;
         const card = ui.addToolCard(action);
+        if (autoNow) card.setState("running");
         this.scrollChat();
 
-        this.setStatus("等待确认操作…", "busy");
-        const proceed = await this.confirmAction(card, this.ctx.toggleState().auto, this.abortController.signal);
+        this.setStatus(autoNow ? "正在执行操作…" : "等待确认操作…", "busy");
+        const proceed = await this.confirmAction(card, autoNow, this.abortController.signal);
 
         const stepRec = { preText, action, result: null };
         if (!proceed) {
@@ -2314,6 +2427,23 @@ export class WorkspaceRuntime {
         // switchtab / newtab 改变了目标页 → 后续默认跟着走
         if (result.switchedTo != null) tabId = result.switchedTo;
         if (result.newTabId != null) tabId = result.newTabId;
+        // ⚠️ AI 刚把当前目标页关掉了 → **必须马上把粘性目标换到别的活页**。
+        //    以前这里不管：之后每一步的边界校验都还在查那个已经关掉的 id ✗，
+        //    于是连着报"目标标签页已经被关闭了"（用户报过），看起来就像"原来的页明明开着"。
+        if (result.closedTabId != null && tabId === result.closedTabId) {
+          const alive = await this.ctx.getAliveTabs(this);
+          const next = alive.find((t) => t.id !== result.closedTabId);
+          if (next) {
+            tabId = next.id;
+            try {
+              targetTab = await chrome.tabs.get(tabId);
+            } catch (_) {
+              targetTab = null;
+            }
+            result.msg =
+              (result.msg || "") + `；目标页已改为 id=${next.id}「${(next.title || "未命名").slice(0, 24)}」`;
+          }
+        }
 
         const storedResult = { ...result };
         delete storedResult.screenshot;

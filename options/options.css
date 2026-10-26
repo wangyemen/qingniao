@@ -408,6 +408,60 @@ button.tiny {
   .hdr-row { grid-template-columns: 1fr; }
 }
 
+/* ===== 两个市场并列 + 分页 ===== */
+.mk-tabs {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+.mk-tab {
+  flex: 1 1 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border, #3a3f46);
+  border-radius: 10px;
+  background: var(--bg-soft, rgba(255, 255, 255, 0.02));
+  color: var(--text-soft, #c9d1d9);
+  font-size: 13.5px;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.15s, background 0.15s;
+}
+.mk-tab:hover { border-color: var(--accent, #2dd4bf); }
+.mk-tab.active {
+  border-color: var(--accent, #2dd4bf);
+  background: var(--accent-soft, rgba(45, 212, 191, 0.12));
+  color: var(--text, #e6edf3);
+  font-weight: 650;
+}
+.mk-tab-num { color: var(--text-faint, #8b949e); font-weight: 400; font-size: 12.5px; }
+
+.mk-pager {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, #3a3f46);
+}
+.mk-page {
+  padding: 5px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border, #3a3f46);
+  background: var(--bg-elev, rgba(255, 255, 255, 0.03));
+  color: var(--text-soft, #c9d1d9);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.mk-page:hover:not(:disabled) { border-color: var(--accent, #2dd4bf); color: var(--accent-2, #2dd4bf); }
+.mk-page.active { background: var(--accent-soft, rgba(45, 212, 191, 0.14)); border-color: var(--accent, #2dd4bf); color: var(--text, #e6edf3); font-weight: 650; }
+.mk-page:disabled { opacity: 0.42; cursor: default; }
+.mk-page-info { margin-left: auto; color: var(--text-faint, #8b949e); font-size: 12.5px; }
+
+/* 来源徽标：官方 / 用户投稿（未审核） */
+.chip-official { border-color: rgba(45, 212, 191, 0.45) !important; color: #8ff0e3 !important; }
+.chip-user { border-color: rgba(245, 158, 11, 0.45) !important; color: #f0b866 !important; }
+
 /* ===== 技能拖拽导入 ===== */
 .drop-zone {
   display: flex;

@@ -81,18 +81,38 @@
           技能就是一份写给 AI 看的操作说明书：什么时候用、按什么步骤做、哪些不能做。
           装到本地后，在侧栏点「技能」就能让它照着干。
         </p>
+
+        <!-- 两个市场**并列**（同一套展示框架，只是换数据源）：
+             官方 = GitHub 仓库里我自己维护的；用户 = 官网接口里的社区投稿（审核通过才上架）。 -->
+        <div class="mk-tabs" role="tablist">
+          <button id="tabOfficial" class="mk-tab active" role="tab" data-market="official">📚 官方市场 <span class="mk-tab-num" id="numOfficial"></span></button>
+          <button id="tabUser" class="mk-tab" role="tab" data-market="user">🧑‍🤝‍🧑 用户市场 <span class="mk-tab-num" id="numUser"></span></button>
+        </div>
+
         <div class="row market-toolbar">
-          <label class="field grow">
-            <span>技能来源（GitHub 仓库地址或市场目录地址）</span>
+          <label class="field grow" id="officialSourceField">
+            <span>官方来源（GitHub 仓库地址或目录地址）</span>
             <input type="text" id="sourceInput" placeholder="https://github.com/wangyemen/qingniao" />
           </label>
-          <button id="resetSourceBtn" class="tiny" title="恢复默认仓库">默认来源</button>
+          <label class="field grow hidden" id="userSourceField">
+            <span>用户市场接口地址（官网提供）</span>
+            <input type="text" id="userSourceInput" placeholder="https://qingniao.gt.tc/api/market.php" />
+          </label>
+          <button id="resetSourceBtn" class="tiny" title="恢复默认来源">默认来源</button>
         </div>
+
         <div class="market-meta-row">
           <span class="hint" id="marketMeta">尚未同步</span>
           <input type="search" id="marketSearch" class="search" placeholder="搜索技能…" />
         </div>
+
         <div id="marketList" class="cards"></div>
+        <div id="marketPager" class="mk-pager hidden"></div>
+
+        <p class="hint" id="userMarketNote" style="margin-top:10px">
+          用户市场是<b>社区投稿</b>，审核通过才上架，但<b>不是官方出品</b>：装好后默认是<b>停用</b>状态，
+          你先在「我的技能」里看一眼正文再打开更稳妥。
+        </p>
       </section>
 
       <section class="panel">
@@ -101,6 +121,7 @@
           <div class="row">
             <button id="importSkillBtn" class="tiny">导入 .md</button>
             <button id="newSkillBtn" class="primary">新建技能</button>
+            <button id="cleanupMetaBtn" class="tiny" title="把历史脏数据里混进正文的元数据块剥掉（以前带 BOM 的文件导入会这样）">清理元数据残留</button>
             <button id="exportAllBtn" class="tiny">全部导出</button>
           </div>
         </div>

@@ -191,6 +191,114 @@ try {
   check("坏文件只提示跳过，页面不崩", /没有导入|只支持|空的/.test(st), st.slice(0, 100));
   check("坏文件没有污染技能表", !(await loadSkills())["logo"], "");
   check("页面没有抛异常（仍然可用）", await opts.evaluate(() => !!document.getElementById("skillDrop")), "");
+
+  // ---------- ⑥ 新格式（HTML 注释装元数据）：编辑框里不该出现元数据 ----------
+  const MD_NEW = `<!-- qingniao-skill
+name: 163mooc-xingfa
+title: 中国大学MOOC刑法
+description: 中国大学MOOC自动刷题
+version: 0.1.0
+author: 青鸟
+tags: [刷题]
+-->
+
+## 步骤
+
+1. 打开课程页
+2. 点开始答题
+`;
+  // 带 BOM 拖进去 —— 这正是之前"整块元数据混进正文"的触发条件
+  await opts.evaluate((text) => {
+    const dt = new DataTransfer();
+    dt.items.add(new File(["\uFEFF" + text], "163mooc-xingfa-SKILL.md", { type: "text/markdown" }));
+    document.getElementById("skillDrop").dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, MD_NEW);
+  await sleep(1300);
+
+  skills = await loadSkills();
+  const imported = skills["163mooc-xingfa"];
+  check("带 BOM 的新格式文件导入成功", !!imported, Object.keys(skills).join(","));
+  check(
+    "元数据被存进字段（标题/说明/版本/作者/标签）",
+    imported &&
+      imported.title === "中国大学MOOC刑法" &&
+      imported.description.includes("自动刷题") &&
+      imported.version === "0.1.0" &&
+      imported.author === "青鸟" &&
+      (imported.tags || []).includes("刷题"),
+    imported ? JSON.stringify({ t: imported.title, v: imported.version, a: imported.author, tags: imported.tags }) : ""
+  );
+  check(
+    "★ 技能正文里没有元数据残留（用户报的就是这条）",
+    imported && !/qingniao-skill|^\s*name:\s|^\s*tags:\s/m.test(imported.body) && imported.body.startsWith("## 步骤"),
+    imported ? JSON.stringify(imported.body.slice(0, 26)) : ""
+  );
+
+  // 在设置页里打开这个技能 → 编辑框（正文框）里也不该有元数据
+  const editor = await opts.evaluate((id) => {
+    const cards = [...document.querySelectorAll("#mineList .card, #mineList article, #mineList .skill-card")];
+    // 点这个技能的"编辑"入口（不同实现按钮文案不同，这里找带标题的那张卡）
+    const card = cards.find((c) => c.textContent.includes("中国大学MOOC刑法"));
+    if (!card) return { found: false };
+    const btn = [...card.querySelectorAll("button")].find((b) => /编辑|修改/.test(b.textContent));
+    if (btn) btn.click();
+    const body = document.getElementById("edBody");
+    return {
+      found: true,
+      edId: document.getElementById("edId").value,
+      edTitle: document.getElementById("edTitle").value,
+      edVersion: document.getElementById("edVersion").value,
+      bodyHasMeta: /qingniao-skill|^\s*name:\s|^\s*tags:\s/m.test(body.value || ""),
+      bodyHead: (body.value || "").slice(0, 30),
+    };
+  }, imported && imported.id);
+  check("设置页里该技能能被打开编辑", editor.found, JSON.stringify(editor));
+  check("★ 编辑框（正文框）里是纯正文，没有元数据", editor.found && !editor.bodyHasMeta, JSON.stringify({ head: editor.bodyHead }));
+  check(
+    "编辑框旁边的字段是自动填好的",
+    editor.found && editor.edId === "163mooc-xingfa" && editor.edTitle === "中国大学MOOC刑法" && editor.edVersion === "0.1.0",
+    JSON.stringify({ id: editor.edId, title: editor.edTitle, v: editor.edVersion })
+  );
+
+  // 直接往正文框里粘一整份带元数据的文件 → 保存后正文应当被剥干净（不会再出现两份元数据）
+  const afterPasteSave = await opts.evaluate(async () => {
+    const body = document.getElementById("edBody");
+    document.getElementById("edId").value = "pasted-skill";
+    document.getElementById("edTitle").value = "粘贴测试";
+    body.value = "---\nname: pasted-skill\ntitle: 粘贴测试\n---\n\n## 正文\n只有这一段是正文\n";
+    document.getElementById("edSaveBtn").click();
+    await new Promise((r) => setTimeout(r, 900));
+    const all = await chrome.storage.local.get(null);
+    const s = (all.ai_skills || {})["pasted-skill"];
+    return { body: s ? s.body : "", bodyHasMeta: s ? /^\s*name:\s/m.test(s.body) : false };
+  });
+  check("粘贴整份文件后保存：正文被剥干净（不会出现两份元数据）", !afterPasteSave.bodyHasMeta && /只有这一段是正文/.test(afterPasteSave.body), JSON.stringify(afterPasteSave.body.slice(0, 40)));
+
+  // ---------- ⑦ 一键清理历史脏数据 ----------
+  const cleaned = await opts.evaluate(async () => {
+    // 造一条"历史脏数据"：正文里带着老 frontmatter
+    const all = await chrome.storage.local.get(null);
+    const skillsMap = all.ai_skills || {};
+    skillsMap["dirty-one"] = {
+      id: "dirty-one",
+      title: "脏数据技能",
+      body: "---\nname: dirty-one\ntitle: 脏数据技能\n---\n\n## 真正的正文\n",
+      enabled: true,
+      source: "local",
+    };
+    await chrome.storage.local.set({ ai_skills: skillsMap });
+    location.reload();
+    return true;
+  });
+  await opts.waitForSelector("#cleanupMetaBtn", { timeout: 10000 });
+  await opts.evaluate(() => document.getElementById("cleanupMetaBtn").click());
+  await sleep(1200);
+  const afterClean = await opts.evaluate(async () => {
+    const all = await chrome.storage.local.get(null);
+    const s = (all.ai_skills || {})["dirty-one"];
+    return { body: s ? s.body : "", status: (document.getElementById("marketStatus") || {}).textContent || "" };
+  });
+  check("一键清理把历史脏数据的元数据剥掉了", !/^\s*name:\s/m.test(afterClean.body) && /真正的正文/.test(afterClean.body), JSON.stringify({ body: afterClean.body.slice(0, 30), status: afterClean.status.slice(0, 40) }));
 } finally {
   await browser.close().catch(() => {});
   fs.rmSync(tmpExt, { recursive: true, force: true });

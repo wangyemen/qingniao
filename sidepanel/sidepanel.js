@@ -164,6 +164,19 @@ const panelInstanceId = Math.random().toString(36).slice(2, 10) + Date.now().toS
 // 输入框内容按工作区暂存（切页时不能串）
 const drafts = new Map();
 
+// "没有工作区的页面"草稿的键：**按标签页分开**，不再共用一个槽
+function pendingDraftKey(tabId) {
+  return "t:" + (tabId != null ? tabId : "__none__");
+}
+
+// 一条消息真的发出去了 → 把对应草稿槽清掉。
+// （以前只清输入框、草稿留着 ✗ → 之后任何一次视图激活都会把发过的内容塞回输入框，
+//   用户看到"切换几个页面，刚才问的问题又出现了"，还容易误发重复消息。）
+function clearDraftFor(tabId, wsId) {
+  if (wsId) drafts.delete(wsId);
+  if (tabId != null) drafts.delete(pendingDraftKey(tabId));
+}
+
 init();
 
 // ===== 上下文接口：给 WorkspaceRuntime 用 =====
@@ -374,9 +387,11 @@ async function init() {
     }
   });
   // 输入框内容按工作区暂存 + 实时刷新"/技能"高亮与补全
+  // ⚠️ 没归属工作区的页面**按标签页分别暂存**（以前所有这种页面共用一个 "__pending__" 槽 ✗ ——
+  //    在 A 页问过的问题，切到 B 页会原样冒出来，用户报过）。
   inputEl.addEventListener("input", () => {
     if (activeWsId) drafts.set(activeWsId, inputEl.value);
-    else drafts.set("__pending__", inputEl.value);
+    else drafts.set(pendingDraftKey(pendingTabId), inputEl.value);
     autoGrowInput();
     updateInputHighlight();
     updateSlashMenu();
@@ -470,6 +485,14 @@ async function init() {
     if (msg.type === "ws:abort" && msg.wsId) {
       const rt = ownerOfWorkspace(msg.wsId);
       if (rt && rt.busy) rt.abort();
+      return;
+    }
+
+    // 另一份面板点了我这份实例里的"执行/取消" → 真正在跑的那份来落地这个决定
+    // （侧栏每个标签页一份文档，卡片可能显示在非执行者那份里 ✗ 所以必须能跨实例回话）
+    if (msg.type === "ws:confirm" && msg.wsId) {
+      const rt = ownerOfWorkspace(msg.wsId);
+      if (rt && typeof rt.pendingConfirm === "function") rt.pendingConfirm(msg.ok === true);
       return;
     }
 
@@ -681,7 +704,23 @@ function bindConfirmDelegate() {
       const wsId = card.dataset.wsId || activeWsId;
       const entry = workspaces.get(wsId);
       const rt = entry && entry.rt;
-      if (!rt || typeof rt.pendingConfirm !== "function") return;
+      if (!rt || typeof rt.pendingConfirm !== "function") {
+        // 这一份实例不是执行者（卡片显示在这里、真正在跑的是另一份侧栏文档）→
+        // 广播出去，让在跑的那份落地这个决定（否则就是"点了没反应"）
+        if (wsId) {
+          try {
+            chrome.runtime.sendMessage({ type: "ws:confirm", wsId, ok: btn.classList.contains("ok-btn") }).catch(() => {});
+          } catch (_) {}
+        }
+        // 视觉上也给点反馈，别让人以为没点到
+        card.classList.remove("pending");
+        card.classList.add(btn.classList.contains("ok-btn") ? "running" : "cancelled");
+        const acts = card.querySelector(".tool-actions");
+        if (acts) acts.innerHTML = "<span class='tool-detail'>" + (btn.classList.contains("ok-btn") ? "执行中…（交给正在运行的那份面板）" : "已取消") + "</span>";
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
       ev.preventDefault();
       ev.stopPropagation();
       const ok = btn.classList.contains("ok-btn");
@@ -1023,7 +1062,7 @@ function activatePending(tabId, tab) {
   setStatus("", "");
   syncDeferChip(null);
   renderAttachments(null);
-  inputEl.value = drafts.get("__pending__") || "";
+  inputEl.value = drafts.get(pendingDraftKey(tabId)) || "";
   inputEl.focus();
 }
 
@@ -1266,16 +1305,30 @@ async function onSend() {
       return;
     }
     if (!text && !currentAttachments().length) return;
+    // ⚠️ 顺序很关键：**先在"还没有工作区"的时候把草稿附件拿到手**，
+    //    再去建工作区。以前是先建工作区、再 currentAttachments() ✗ ——
+    //    那时 activeRuntime() 已经指向新工作区了，于是拿到的是**空的**新列表 ✗，
+    //    结果"在没有工作区的页面上贴的图"永远进不了消息（用户看不到自己附的截图就是这个原因）。
+    const draftAtts = currentAttachments().slice();
     const newRt = createWorkspaceForTab(cur.id, cur);
-    // 把草稿态的附件带过去
-    newRt.attachments = currentAttachments();
+    newRt.attachments = draftAtts;
     pendingAttachments = [];
     inputEl.value = "";
     updateInputHighlight();
+    // 草稿槽也一起清（否则切页又会把这条塞回输入框）
+    clearDraftFor(cur.id, newRt.ws.id);
     const atts = newRt.attachments.slice();
     newRt.attachments = [];
     renderAttachments(newRt);
-    await newRt.send({ text: sendText, displayText, attachments: atts });
+    try {
+      await newRt.send({ text: sendText, displayText, attachments: atts });
+    } catch (err) {
+      // 发失败就把文字放回输入框，别让用户白打一遍
+      inputEl.value = text;
+      updateInputHighlight();
+      setStatus("发送失败，文字已放回输入框：" + ((err && err.message) || err), "err");
+      drafts.set(newRt.ws.id, text);
+    }
     return;
   }
 
@@ -1290,6 +1343,7 @@ async function onSend() {
     renderAttachments(rt);
     inputEl.value = "";
     updateInputHighlight();
+    clearDraftFor(curTabId, rt.ws.id);
     try {
       chrome.runtime.sendMessage({
         type: "ws:send",
@@ -1305,10 +1359,18 @@ async function onSend() {
 
   inputEl.value = "";
   updateInputHighlight();
+  clearDraftFor(curTabId, rt.ws.id);
   const atts = rt.attachments.slice();
   rt.attachments = [];
   renderAttachments(rt);
-  await rt.send({ text: sendText, displayText, attachments: atts });
+  try {
+    await rt.send({ text: sendText, displayText, attachments: atts });
+  } catch (err) {
+    inputEl.value = text;
+    updateInputHighlight();
+    drafts.set(rt.ws.id, text);
+    setStatus("发送失败，文字已放回输入框：" + ((err && err.message) || err), "err");
+  }
 }
 
 // 未建工作区时，附件先存在一个临时数组里
