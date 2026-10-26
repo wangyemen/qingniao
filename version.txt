@@ -4,6 +4,19 @@ released: 2026-10-25
 repo: https://github.com/wangyemen/qingniao
 
 ## 0.4.4
+- 新增：**自定义请求头**（给 Cloudflare AI Gateway 这类**鉴权网关**用）
+  · 供应商卡片里可加任意请求头（名称 + 值），随每次模型请求一起发出去；
+    Cloudflare AI Gateway 常用头 `cf-aig-authorization` 有一键添加
+  · 值里可以用 **`{{key}}`** 代表当前轮询到的 API Key（例如 `Bearer {{key}}`）
+  · 自定义的 `Authorization` / `x-api-key` 会**覆盖**自动鉴权头（以你的为准）；
+    名字不合法的头自动跳过（否则 fetch 会直接报错）
+- 新增：**接入方式二选一：OpenAI 兼容 / Anthropic 兼容**（每个供应商各自选）
+  · OpenAI 兼容：`{BaseURL}/chat/completions`，`Authorization: Bearer <Key>`（默认，行为不变）
+  · Anthropic 兼容：`{BaseURL}/messages`，自动带 `x-api-key` 与 `anthropic-version: 2023-06-01`
+    · system 提示词自动挪到独立的 `system` 字段；相邻同角色消息自动合并（Anthropic 要求交替）；
+      图片块 `image_url` 自动换成 Anthropic 的 `image` 块（data URL 走 base64，网址走 url）；
+      `max_tokens` 必填会自动补上；流式事件按 Anthropic 的 `content_block_delta` 解析
+    · 「深度思考」开关在这条接入上不发送（Anthropic 的 extended thinking 参数与 OpenAI 那套不通用）
 - 修复：**富文本编辑器 / 复杂页面上"时好时坏"的输入与点击**（用户反馈的"有些网站试很多轮都不成、开始成功后来又迷失"）
   · **逐字输入这条路本来就是坏的**：拟人打字的等待函数在早前重构里被删掉了，`type` 动作与
     `fill human:true` 一调用就报 "autoSleep is not defined" —— 现在补回（这是"输入有问题"最实的一条）

@@ -72,6 +72,100 @@ function providerCard(p, idx) {
   row1.appendChild(textField("Base URL", p.baseUrl, (v) => (p.baseUrl = v)));
   card.appendChild(row1);
 
+  // ===== 兼容方式：OpenAI 兼容 / Anthropic 兼容（二选一）=====
+  // 两家的**接口路径、鉴权头、消息格式、流事件**都不一样，所以必须显式选一个。
+  const compatRow = document.createElement("div");
+  compatRow.className = "row";
+  const compatLabel = document.createElement("label");
+  compatLabel.className = "field";
+  const compatSpan = document.createElement("span");
+  compatSpan.textContent = "兼容方式";
+  const compatSel = document.createElement("select");
+  for (const [val, text] of [
+    ["openai", "OpenAI 兼容（/chat/completions · Authorization: Bearer）"],
+    ["anthropic", "Anthropic 兼容（/messages · x-api-key）"],
+  ]) {
+    const o = document.createElement("option");
+    o.value = val;
+    o.textContent = text;
+    compatSel.appendChild(o);
+  }
+  compatSel.value = p.apiCompat === "anthropic" ? "anthropic" : "openai";
+  compatSel.addEventListener("change", () => {
+    p.apiCompat = compatSel.value;
+    render(); // 换兼容方式后，下面"实际会发什么"的提示要跟着变
+  });
+  compatLabel.appendChild(compatSpan);
+  compatLabel.appendChild(compatSel);
+  compatRow.appendChild(compatLabel);
+  card.appendChild(compatRow);
+
+  const compatHint = document.createElement("p");
+  compatHint.className = "hint";
+  compatHint.textContent =
+    compatSel.value === "anthropic"
+      ? "Anthropic 兼容：会请求 {BaseURL}/messages，自动带 x-api-key 与 anthropic-version: 2023-06-01（若你在下面自定义了同名头，以你的为准）。system 提示词会自动挪到独立的 system 字段，相邻同角色消息会自动合并；「深度思考」开关在这条接入上不发送（Anthropic 的 extended thinking 参数与 OpenAI 那套不通用）。"
+      : "OpenAI 兼容：会请求 {BaseURL}/chat/completions，自动带 Authorization: Bearer <Key>（若你在下面自定义了 Authorization，以你的为准）。";
+  card.appendChild(compatHint);
+
+  // ===== 自定义请求头 =====
+  // 用于 Cloudflare AI Gateway 这类**鉴权网关**：除了厂商 Key，还要额外带自己的头，
+  // 例如 cf-aig-authorization: Bearer <网关令牌>。值里可以用 {{key}} 代表当前 API Key。
+  const hdrLabel = document.createElement("div");
+  hdrLabel.className = "block-label";
+  hdrLabel.textContent = "自定义请求头（网关要用时填；值里可用 {{key}} 代表当前 API Key）";
+  card.appendChild(hdrLabel);
+
+  const hdrTable = document.createElement("div");
+  hdrTable.className = "hdr-table";
+  if (!Array.isArray(p.headers)) p.headers = [];
+  p.headers.forEach((h, hi) => {
+    const row = document.createElement("div");
+    row.className = "hdr-row";
+    const nameI = document.createElement("input");
+    nameI.type = "text";
+    nameI.placeholder = "头名称，如 cf-aig-authorization";
+    nameI.value = h.name || "";
+    nameI.addEventListener("change", () => (h.name = nameI.value.trim()));
+    const valI = document.createElement("input");
+    valI.type = "text";
+    valI.placeholder = "值，如 Bearer {{key}}";
+    valI.value = h.value || "";
+    valI.addEventListener("change", () => (h.value = valI.value));
+    const del = document.createElement("button");
+    del.className = "tiny";
+    del.textContent = "删除";
+    del.addEventListener("click", () => {
+      p.headers.splice(hi, 1);
+      render();
+    });
+    row.appendChild(nameI);
+    row.appendChild(valI);
+    row.appendChild(del);
+    hdrTable.appendChild(row);
+  });
+  const addHdrRow = document.createElement("div");
+  addHdrRow.className = "row";
+  const addHdr = document.createElement("button");
+  addHdr.className = "tiny";
+  addHdr.textContent = "+ 添加请求头";
+  addHdr.addEventListener("click", () => {
+    p.headers.push({ name: "", value: "" });
+    render();
+  });
+  const cfBtn = document.createElement("button");
+  cfBtn.className = "tiny";
+  cfBtn.textContent = "＋ Cloudflare AI Gateway 常用头";
+  cfBtn.title = "加一条 cf-aig-authorization（值里用 {{key}} 或换成你的网关令牌）";
+  cfBtn.addEventListener("click", () => {
+    p.headers.push({ name: "cf-aig-authorization", value: "Bearer {{key}}" });
+    render();
+  });
+  addHdrRow.appendChild(addHdr);
+  addHdrRow.appendChild(cfBtn);
+  hdrTable.appendChild(addHdrRow);
+  card.appendChild(hdrTable);
+
   // 域名探测（主要服务 Agnes 这类多站点 Key 体系）
   const probeRow = document.createElement("div");
   probeRow.className = "row";
@@ -346,6 +440,10 @@ function addProvider() {
     id: uid(),
     name: "新供应商",
     baseUrl: "https://api.example.com/v1",
+    // 兼容方式二选一：默认 OpenAI 兼容（/chat/completions）
+    apiCompat: "openai",
+    // 自定义请求头（网关要用时在卡片里添加）
+    headers: [],
     models: [{ id: "model-id", label: "model-id" }],
     keys: [],
   });
