@@ -554,6 +554,248 @@ async function loadChangelog() {
   changelogLoaded = true;
 }
 
+// ---------- 导入技能（拖拽 / 选文件 / 粘贴内容）----------
+//
+// 格式就是导出时用的那一份：标准 SKILL.md（--- frontmatter --- + 正文）。
+// 所以导入 = parseSkillMd 反过来解析，再 upsertSkill 存进来。
+// 也兼容几种"顺手会拖进来"的东西：单个技能 JSON、市场目录 JSON（含 skills 数组）、
+// 以及没有 frontmatter 的裸 Markdown（用文件名当 id、首行当标题）。
+
+// 生成技能 id。⚠️ 只有"从文件名推出来的"才剥掉结尾的 -skill ——
+// 导出文件名是 <id>-SKILL.md，所以要还原成 <id>；
+// 但 frontmatter 里 model 自己写的 name（比如 "ai-skill"）不能被误剥。
+function slugifyId(raw, opts) {
+  const fromFilename = !!(opts && opts.fromFilename);
+  let s = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\.(md|markdown|txt|json)$/i, "");
+  if (fromFilename) s = s.replace(/-skill$/i, "");
+  return s.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+// 一个文件/一段文本 → 技能对象数组（解析失败抛错，错误信息给用户看）
+function parseImportedSkill(text, filename) {
+  const src = String(text || "");
+  const trimmed = src.trim();
+  if (!trimmed) throw new Error("文件是空的");
+
+  // ① JSON：市场目录或单个技能
+  if (/^[[{]/.test(trimmed) && /\.json$/i.test(filename || "")) {
+    let data = null;
+    try {
+      data = JSON.parse(trimmed);
+    } catch (_) {
+      throw new Error("JSON 解析失败");
+    }
+    const list = Array.isArray(data) ? data : Array.isArray(data.skills) ? data.skills : [data];
+    const out = [];
+    for (const it of list) {
+      if (!it || typeof it !== "object") continue;
+      const id = slugifyId(it.id || it.name || it.title);
+      if (!id) continue;
+      const body = String(it.body || it.content || it.markdown || "").trim();
+      if (!body) continue;
+      out.push({
+        id,
+        title: String(it.title || it.id || id).trim(),
+        description: String(it.description || "").trim(),
+        version: String(it.version || "1.0.0").trim(),
+        author: String(it.author || "").trim(),
+        tags: Array.isArray(it.tags) ? it.tags.map(String) : [],
+        icon: String(it.icon || "").trim(),
+        body,
+      });
+    }
+    if (!out.length) throw new Error("这份 JSON 里没有可导入的技能（需要 id + body）");
+    return out;
+  }
+
+  // ② SKILL.md（有 frontmatter 走标准解析；没有就用文件名兜底）
+  const { meta, body } = parseSkillMd(src);
+  const hasFm = !!(meta && (meta.name || meta.title));
+  const mdBody = String(body || "").trim();
+  if (!mdBody) throw new Error("没有正文内容");
+
+  const id = slugifyId(meta.name || meta.title) || slugifyId(filename || "", { fromFilename: true });
+  if (!id) throw new Error("看不出技能 id（frontmatter 里的 name，或文件名 <id>-SKILL.md）");
+  const firstLine = (mdBody.split(/\r?\n/).find((l) => l.trim()) || "").replace(/^#+\s*/, "").trim();
+  return [
+    {
+      id,
+      title: String(meta.title || firstLine || id).trim(),
+      description: String(meta.description || "").trim(),
+      version: String(meta.version || "1.0.0").trim(),
+      author: String(meta.author || "").trim(),
+      tags: Array.isArray(meta.tags) ? meta.tags.map(String) : [],
+      icon: String(meta.icon || "").trim(),
+      body: text,
+      ...(hasFm ? {} : { note: "这份文件没有 frontmatter，标题/说明是从正文和文件名里推出来的" }),
+    },
+  ];
+}
+
+async function importSkillFiles(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  const parsed = [];
+  const failed = [];
+  for (const f of list) {
+    // 只认文本类，别把图片拖进来还把页面卡住
+    if (!/\.(md|markdown|txt|json)$/i.test(f.name || "")) {
+      failed.push(`${f.name || "未命名文件"}：只支持 .md / .markdown / .txt / .json`);
+      continue;
+    }
+    try {
+      const text = await f.text();
+      for (const s of parseImportedSkill(text, f.name)) parsed.push(s);
+    } catch (err) {
+      failed.push(`${f.name || "未命名文件"}：${(err && err.message) || err}`);
+    }
+  }
+  if (!parsed.length) {
+    setStatus("没有导入任何技能。" + failed.join("；"), "err");
+    return;
+  }
+
+  // 同名处理：默认覆盖（多半是自己导出后又改过的版本）；用户不同意就保留为新副本
+  skills = await loadSkills();
+  const clashes = parsed.filter((s) => skills[s.id]);
+  let overwrite = true;
+  if (clashes.length) {
+    const uniq = [...new Set(clashes.map((s) => s.id))];
+    overwrite = window.confirm(
+      `有 ${uniq.length} 个技能 id 已经存在：\n${uniq.join("、")}\n\n` +
+        `点「确定」= 覆盖它们（保留原 id）\n点「取消」= 都保留成新副本（自动加后缀）`
+    );
+  }
+
+  let added = 0;
+  let replaced = 0;
+  const renamed = [];
+  for (const s of parsed) {
+    let id = s.id;
+    if (skills[id] && !overwrite) {
+      let n = 2;
+      while (skills[`${s.id}-${n}`]) n++;
+      id = `${s.id}-${n}`;
+      renamed.push(`${s.id} → ${id}`);
+    }
+    const prev = skills[id] || {};
+    if (skills[id] && overwrite) replaced++;
+    else added++;
+    await upsertSkill({
+      id,
+      title: s.title || id,
+      description: s.description || "",
+      version: s.version || "1.0.0",
+      author: s.author || "",
+      tags: s.tags || [],
+      icon: s.icon || "",
+      body: s.body,
+      // 导入进来的算"本地技能"；如果覆盖的是一个市场技能，保留它的市场来源信息
+      source: prev.source || "local",
+      enabled: prev.enabled !== false,
+      marketSource: prev.marketSource,
+      marketVersion: prev.marketVersion,
+      marketUrl: prev.marketUrl,
+      importedAt: Date.now(),
+    });
+  }
+
+  skills = await loadSkills();
+  renderMine();
+  renderMarket();
+
+  const parts = [`已导入 ${added} 个技能`];
+  if (replaced) parts.push(`覆盖 ${replaced} 个同名`);
+  if (renamed.length) parts.push(`重命名：${renamed.join("、")}`);
+  if (failed.length) parts.push(`跳过 ${failed.length} 个（${failed.join("；")}）`);
+  setStatus(parts.join(" · "), failed.length ? "err" : "ok");
+}
+
+function bindImport() {
+  const drop = $("skillDrop");
+  const input = $("skillFileInput");
+  if (!drop || !input) return;
+
+  $("importSkillBtn").addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    await importSkillFiles(input.files);
+    input.value = ""; // 同一个文件能再导入一次
+  });
+
+  // 点一下拖拽区也打开选文件（拖拽之外的手动路径）
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      input.click();
+    }
+  });
+
+  let depth = 0; // dragenter/dragleave 会冒泡，用计数避免闪
+  const setOn = (on) => drop.classList.toggle("dragover", on);
+  drop.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    depth++;
+    setOn(true);
+  });
+  drop.addEventListener("dragover", (e) => {
+    e.preventDefault(); // 不 preventDefault 浏览器就不允许放下
+    e.dataTransfer.dropEffect = "copy";
+    setOn(true);
+  });
+  drop.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    depth = Math.max(0, depth - 1);
+    if (!depth) setOn(false);
+  });
+  drop.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    depth = 0;
+    setOn(false);
+    const dt = e.dataTransfer;
+    if (!dt) return;
+    if (dt.files && dt.files.length) {
+      await importSkillFiles(dt.files);
+      return;
+    }
+    // 从别处拖来一段文字（比如从 GitHub 网页上拖选中的 SKILL.md 内容）
+    const text = dt.getData ? dt.getData("text/plain") : "";
+    if (text && text.trim()) {
+      try {
+        const parsed = parseImportedSkill(text, "拖入的文本.md");
+        const file = new File([text], `${parsed[0].id}-SKILL.md`, { type: "text/markdown" });
+        await importSkillFiles([file]);
+      } catch (err) {
+        setStatus("拖入的内容不是有效的 SKILL.md：" + ((err && err.message) || err), "err");
+      }
+      return;
+    }
+    setStatus("没读到文件；请拖入 .md 文件，或点这里选择文件", "err");
+  });
+
+  // 整页也能接住拖放（拖到面板外时给上面那块高亮，避免"拖了半天没反应"）
+  window.addEventListener("dragover", (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) {
+      e.preventDefault();
+      setOn(true);
+    }
+  });
+  window.addEventListener("dragleave", (e) => {
+    if (e.relatedTarget == null) setOn(false);
+  });
+  window.addEventListener("drop", async (e) => {
+    if (e.target && e.target.closest && e.target.closest("#skillDrop")) return; // 交给上面那块处理
+    const dt = e.dataTransfer;
+    if (!dt || !dt.files || !dt.files.length) return;
+    e.preventDefault();
+    setOn(false);
+    await importSkillFiles(dt.files);
+  });
+}
+
 // ---------- 下载 ----------
 function downloadText(filename, text) {
   const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
@@ -592,6 +834,7 @@ function downloadSkill(skill) {
   bindNav();
   bindMarket();
   bindMine();
+  bindImport();
   bindEditor();
 
   skills = await loadSkills();

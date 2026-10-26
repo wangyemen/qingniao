@@ -306,7 +306,8 @@ export class WorkspaceRuntime {
     // 自动化任务：用户点取消时置 true，循环每轮检查它（这样"取消"才真的能停）
     this.automationCancel = false;
     // AI 自己用 newtab 开过的标签页（只有这些才允许 closetab 关）
-    this.aiOpenedTabs = new Set();
+    // AI 自己开的页记在 ws.aiTabs 里（落盘，跨侧栏实例也认）
+    if (!Array.isArray(this.ws.aiTabs)) this.ws.aiTabs = [];
 
     // 每个工作区自己一份 chat DOM（非激活时脱离文档，但照样能跑）
     this.chatEl = document.createElement("div");
@@ -696,11 +697,13 @@ export class WorkspaceRuntime {
       }
       signal?.addEventListener("abort", onAbort, { once: true });
       this.pendingConfirm = finish;
-      card.root.querySelector(".ok-btn").addEventListener("click", () => {
-        card.setState("running");
-        finish(true);
-      });
-      card.root.querySelector(".cancel-btn").addEventListener("click", () => finish(false));
+      // ⚠️ 这里**故意不**给按钮单独挂监听器。
+      //    侧栏在切换标签页 / 同步会话时会重建整份消息列表（renderSession），
+      //    卡片被重新创建，挂上去的监听器随之消失 —— 用户看到"执行/取消"还在、
+      //    点了却没反应（用户报过这个问题）。改成**事件委托**：文档级统一拦截，
+      //    卡片怎么重建都点得到（见 sidepanel.js 的 bindConfirmDelegate）。
+      card.root.dataset.wsId = this.ws.id;
+      card.root.dataset.pending = "1";
     });
   }
 
@@ -1343,27 +1346,67 @@ export class WorkspaceRuntime {
   //      也接受标题 / URL 片段。**解析不到就报错**（列出可用 id），绝不悄悄换个页执行。
   //   ② 没写 tab → 沿用**本轮的粘性目标**（AI 之前声明过的那页；没声明过就是本轮起始页）。
   //   ③ 粘性目标没了（页被关） → 退回工作区里第一个活着的页。
-  async pickTargetTab(action, fallbackId) {
+  //
+  // ⚠️ 两个"用户报过"的坑：
+  //   · 找不到时**先把工作区列表重读一遍再试**：侧栏每页一份文档，别处的实例刚把新页并进来时，
+  //     本实例的内存列表可能还没跟上，直接报错就会说"这一页已关闭"，而其实它开着。
+  //   · 报错文案要说真话：区分"不在本工作区"与"暂时读不到（可能正在跳转）"，别一律说"已关闭"。
+  async pickTargetTab(action, fallbackId, retried) {
     const alive = await this.ctx.getAliveTabs(this);
     if (!alive.length) return { error: "工作区里的标签页都已关闭" };
     const listText = alive.map((t, i) => `[${i}] id=${t.id} 「${(t.title || t.url || "未命名").slice(0, 30)}」`).join("  ");
 
     const want = action && action.tab;
+    const inWorkspace = (id) => this.ws.tabIds.includes(id) || (this.ws.aiTabs || []).includes(id);
+
     if (want !== undefined && want !== null && want !== "" && want !== "current") {
       const n = Number(want);
+      let hitId = null;
+      let how = "";
       if (Number.isFinite(n)) {
-        if (alive.some((t) => t.id === n)) return { id: n, how: "id" };
-        if (n >= 0 && n < alive.length) return { id: alive[n].id, how: "序号" };
+        if (alive.some((t) => t.id === n)) {
+          hitId = n;
+          how = "id";
+        } else if (inWorkspace(n) && !alive.some((t) => t.id === n) && !retried) {
+          // 在这个工作区名下、但此刻读不到（可能在跳转/重载）→ 重读列表再试一次
+          if (this.ctx.reloadWorkspaces) await this.ctx.reloadWorkspaces();
+          return this.pickTargetTab(action, fallbackId, true);
+        } else if (n >= 0 && n < alive.length) {
+          hitId = alive[n].id;
+          how = "序号";
+        }
       } else {
         const s = String(want);
-        const hit =
-          alive.find((t) => (t.title || "").includes(s)) ||
-          alive.find((t) => (t.url || "").includes(s));
-        if (hit) return { id: hit.id, how: "标题/网址" };
+        const hit = alive.find((t) => (t.title || "").includes(s)) || alive.find((t) => (t.url || "").includes(s));
+        if (hit) {
+          hitId = hit.id;
+          how = "标题/网址";
+        }
       }
+      if (hitId != null) {
+        if (!inWorkspace(hitId)) {
+          return {
+            error: `标签页 id=${hitId} 不在本工作区里，不能操作它`,
+            hint: `你只能操作本工作区的页：${listText}`,
+          };
+        }
+        return { id: hitId, how };
+      }
+      // 完全找不到：可能是"它确实被关了"，也可能只是"列表还没同步"
+      if (!retried && this.ctx.reloadWorkspaces) {
+        await this.ctx.reloadWorkspaces();
+        return this.pickTargetTab(action, fallbackId, true);
+      }
+      let stillOpen = false;
+      try {
+        const t = await chrome.tabs.get(Number(want));
+        stillOpen = !!t;
+      } catch (_) {}
       return {
-        error: `你指定的标签页「${want}」不在本工作区里（或已关闭）。可用的：${listText}`,
-        hint: "请用上面列出的 id（推荐）或位置编号；不要猜。",
+        error: stillOpen
+          ? `这一页（id=${want}）还在，但不在本工作区名下，我不能操作它`
+          : `找不到标签页 id=${want}（它可能已经被关闭了）`,
+        hint: `可用的：${listText}`,
       };
     }
 
@@ -1421,7 +1464,7 @@ export class WorkspaceRuntime {
         let joined = false;
         for (let attempt = 0; attempt < 3 && !joined; attempt++) {
           this.addTab(created.id);
-          this.aiOpenedTabs.add(created.id);
+          if (!this.ws.aiTabs.includes(created.id)) this.ws.aiTabs.push(created.id);
           this.ctx.persist();
           await new Promise((r) => setTimeout(r, 120));
           try {
@@ -1463,7 +1506,7 @@ export class WorkspaceRuntime {
       if (!alive.some((t) => t.id === wantId)) {
         return { ok: false, msg: "要关闭的标签页不在本工作区里（或已关闭）" };
       }
-      if (!this.aiOpenedTabs.has(wantId)) {
+      if (!(this.ws.aiTabs || []).includes(wantId)) {
         return {
           ok: false,
           msg: "只能关闭你自己用 newtab 打开的临时页；这一页是用户的页面，不能关",
@@ -1476,7 +1519,7 @@ export class WorkspaceRuntime {
       try {
         const t = await chrome.tabs.get(wantId).catch(() => null);
         await chrome.tabs.remove(wantId);
-        this.aiOpenedTabs.delete(wantId);
+        this.ws.aiTabs = (this.ws.aiTabs || []).filter((x) => x !== wantId);
         this.removeTab(wantId);
         if (this.ws.rootTabId === wantId && this.ws.tabIds.length) this.ws.rootTabId = this.ws.tabIds[0];
         this.ctx.persist();
@@ -2361,7 +2404,7 @@ export class WorkspaceRuntime {
           const rows = scopeList
             .map((t, i) => {
               const cur = t.id === tabId ? " ←当前目标" : "";
-              const mine = this.aiOpenedTabs && this.aiOpenedTabs.has(t.id) ? "（我自己开的）" : "";
+              const mine = (this.ws.aiTabs || []).includes(t.id) ? "（我自己开的）" : "";
               return `  [${i}] id=${t.id} 「${(t.title || t.url || "未命名").slice(0, 36)}」${mine}${cur}`;
             })
             .join("\n");

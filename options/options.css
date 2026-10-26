@@ -378,6 +378,32 @@ button.tiny {
   color: var(--text-faint);
 }
 
+/* ===== 技能拖拽导入 ===== */
+.drop-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  margin: 10px 0 12px;
+  border: 1.5px dashed var(--border-strong, #3a3f46);
+  border-radius: 12px;
+  background: var(--bg-soft, rgba(255, 255, 255, 0.02));
+  color: var(--text-soft, #c9d1d9);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, transform 0.15s;
+}
+.drop-zone b { font-size: 13.5px; }
+.drop-zone span { color: var(--text-faint, #8b949e); font-size: 12px; }
+.drop-zone:hover { border-color: var(--accent, #2dd4bf); }
+.drop-zone:focus-visible { outline: 2px solid var(--accent, #2dd4bf); outline-offset: 2px; }
+/* 拖拽悬停：整块亮起来，让人确信"松手就能导入" */
+.drop-zone.dragover {
+  border-color: var(--accent, #2dd4bf);
+  background: var(--accent-soft, rgba(45, 212, 191, 0.12));
+  transform: translateY(-1px);
+}
+
 @keyframes fadeUp {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }

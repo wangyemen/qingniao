@@ -25,6 +25,10 @@ import {
   newSession,
   loadWorkspaces,
   saveWorkspaces,
+  // ⚠️ 这个也要 import：监听 storage 变化时要用它拼出"本窗口的工作区键"
+  //    （漏了它会在监听器里抛 ReferenceError → 后面的会话/横条/忙碌同步整段跑不到，
+  //      表现为"横条不收、别的面板看不到更新"，测试抓到过）
+  WORKSPACES_KEY,
   newWorkspace,
   loadSkills,
   loadMarketSettings,
@@ -176,12 +180,15 @@ const runtimeCtx = {
     inputEl.value = text;
     inputEl.focus();
   },
+  // 开关状态：**以设置对象为准**（勾选框只是它的镜像）。
+  // 以前读的是 DOM 勾选框 —— 在"每个标签页一份侧栏文档"的结构下，
+  // 别的标签页改了设置，这份文档的勾选框可能还是旧值，会导致"开了自动执行还弹确认框"。
   toggleState: () => ({
-    ctx: ctxToggle.checked,
-    ctl: ctlToggle.checked,
-    auto: autoToggle.checked,
+    ctx: settings ? settings.contextEnabled !== false : ctxToggle.checked,
+    ctl: settings ? settings.controlEnabled !== false : ctlToggle.checked,
+    auto: settings ? !!settings.autoExecute : autoToggle.checked,
     shot: shotToggle.checked && !shotToggle.disabled,
-    think: thinkToggle.checked,
+    think: settings ? settings.thinkingEnabled !== false : thinkToggle.checked,
   }),
   onStateChange(rt) {
     // 非激活工作区也在后台跑。这里只刷新切换条上的"正在跑"小圆点，
@@ -199,6 +206,8 @@ const runtimeCtx = {
   persist: () => persistAll(),
   // 工作区里的标签页变了（AI newtab / closetab）→ 刷新顶部的切换条
   renderWsBar: () => renderWsBar(),
+  // 让运行时能主动"重读一遍工作区列表"（目标页一时读不到时用，避免误报"已关闭"）
+  reloadWorkspaces: () => reloadWorkspaces(),
   markBusy: (wsId, on) => markBusy(wsId, on),
   // 用户此刻正在看的标签页（决定"这一轮该操作哪一页"）。
   // 不直接用缓存的 pendingTabId：headless / 多窗口下 lastFocusedWindow 可能滞后，
@@ -241,6 +250,7 @@ async function init() {
   renderModelOptions();
   syncShotToggle();
   syncAutoToggle();
+  bindConfirmDelegate(); // 执行/取消用事件委托，卡片重建后也点得动
 
   await restoreWorkspaces();
   await refreshActive();
@@ -487,8 +497,28 @@ async function init() {
 
   // 别的上下文（另一份侧栏文档 / 另一个窗口）写了存储 → 本视图跟着刷新。
   // 这是"我明明就在这个会话里，却看不到更新"的正解：不依赖"重新进入"。
+  //
+  // ⚠️ 这里**必须也同步"设置"与"工作区列表"**：
+  //    Chrome 的侧栏是"每个标签页一份文档"。用户在标签页 A 打开了「自动执行」、
+  //    或 AI 在标签页 A 新开了一页 —— 标签页 B 的那份文档（它有自己的内存副本）如果不同步，
+  //    就会：① 明明开了自动执行还弹确认框；② 切到 AI 新开的页却显示"新对话"；
+  //    ③ 认为 AI 开的页"不在工作区/已关闭"。这三条都是用户实际报过的。
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
+
+    // 设置被改（在本实例或别的实例）→ 内存设置与界面勾选框都跟上
+    if (changes["ai_browser_settings"]) {
+      const fresh = changes["ai_browser_settings"].newValue;
+      if (fresh) {
+        settings = fresh;
+        syncTogglesFromSettings();
+      }
+    }
+
+    // 工作区列表被改（别的实例新建/并入/移出/关闭了标签页）→ 重读列表，再做"必要的"视图调整
+    if (changes[WORKSPACES_KEY(windowId)] || changes["ai_workspaces"]) {
+      resyncActiveView().catch(() => {});
+    }
 
     // 会话被更新：如果正是当前显示的那份，且自己没在跑，就换上新内容并重绘
     const sess = changes["ai_browser_sessions"];
@@ -512,12 +542,17 @@ async function init() {
     // 后台任务表被更新：任务已不在表里（已完成/已取消）→ 收起横条
     if (changes["ai_defer_tasks"]) {
       const rt = activeRuntime();
-      if (rt && rt.activeDeferTask) {
-        const tasks = changes["ai_defer_tasks"].newValue || {};
-        if (!tasks[rt.activeDeferTask.id]) {
-          rt.activeDeferTask = null;
-          syncDeferChip(rt);
-        }
+      const tasks = changes["ai_defer_tasks"].newValue || {};
+      if (rt) {
+        const id = rt.activeDeferTask && rt.activeDeferTask.id;
+        if (id && !tasks[id]) rt.activeDeferTask = null;
+        // ⚠️ 不管本地还记不记得这个任务，都按当前状态重画一次。
+        //    以前只在"本地有记录且表里没有"时才收起 —— 本地记录一旦先丢，
+        //    横条就永远挂在那儿（自愈失效，测试抓到过）。
+        syncDeferChip(rt);
+      } else {
+        // 当前没有激活的工作区 → 横条不该继续挂在这里
+        deferChip.classList.add("hidden");
       }
     }
 
@@ -541,6 +576,10 @@ function persistAll() {
       id: ws.id,
       rootTabId: ws.rootTabId,
       tabIds: ws.tabIds.slice(),
+      // AI 自己开的临时页（只有这些允许 closetab 关）：
+      // **必须落盘** —— 侧栏每页一份文档，换个实例就不认识内存里的 Set 了，
+      // 那会导致"AI 说自己开的页不是自己开的"或"找不到标签页"（用户报过）。
+      aiTabs: Array.from(ws.aiTabs || []),
       sessionId: ws.sessionId,
       providerId: ws.providerId,
       modelId: ws.modelId,
@@ -548,6 +587,147 @@ function persistAll() {
     });
   }
   saveWorkspaces(windowId, list).catch(() => {});
+}
+
+// 设置变了（别的标签页/设置页改的）→ 把四个勾选框拉回一致。
+// 为什么必须有：侧栏是"每个标签页一份文档"，用户在 A 页勾上「自动执行」，
+// B 页那份文档的勾选框还是旧值 → 明明开了自动，AI 在 B 页干活时照样弹确认框（用户报过）。
+function syncTogglesFromSettings() {
+  if (!settings) return;
+  ctxToggle.checked = settings.contextEnabled !== false;
+  thinkToggle.checked = settings.thinkingEnabled !== false;
+  ctlToggle.checked = settings.controlEnabled !== false;
+  autoToggle.checked = !!settings.autoExecute;
+  syncShotToggle();
+  syncAutoToggle();
+}
+
+// 重读工作区列表并**合并**进内存。
+// ⚠️ 与 restoreWorkspaces 的区别：这里绝不重建已有工作区的 rt ——
+//    那一轮可能正在跑，重建就把它的会话/忙碌状态丢了。只合并"成员变化"和"会话切换"。
+async function reloadWorkspaces() {
+  if (windowId == null) return;
+  const { list } = await loadWorkspaces(windowId);
+  if (!list.length) return;
+
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ windowId });
+  } catch (_) {
+    return;
+  }
+  if (!tabs.length) return;
+
+  const aliveIds = new Set(tabs.map((t) => t.id));
+  const sessions = await listSessions();
+  let changed = false;
+
+  for (const w of list) {
+    const tabIds = (w.tabIds || []).filter((id) => aliveIds.has(id));
+    if (!tabIds.length) continue;
+    const rootTabId = tabIds.includes(w.rootTabId) ? w.rootTabId : tabIds[0];
+    const entry = workspaces.get(w.id);
+
+    if (entry) {
+      const beforeKey = entry.ws.tabIds.join(",");
+      entry.ws.tabIds = tabIds;
+      entry.ws.rootTabId = rootTabId;
+      if (Array.isArray(w.aiTabs)) entry.ws.aiTabs = w.aiTabs.slice();
+      // 会话被切换（用户新建了对话 / 在别的实例里换了会话）→ 本实例跟着换并重绘
+      if (entry.ws.sessionId !== w.sessionId) {
+        const sess = sessions.find((s) => s.id === w.sessionId);
+        if (sess) {
+          entry.ws.sessionId = sess.id;
+          sess.workspaceId = entry.ws.id;
+          entry.rt.session = sess;
+          if (!entry.rt.busy) entry.rt.renderSession();
+        }
+      }
+      if (beforeKey !== tabIds.join(",")) changed = true;
+    } else {
+      const ws = { ...w, tabIds, rootTabId };
+      let sess = sessions.find((s) => s.id === ws.sessionId);
+      if (!sess) sess = newSession(ws.id);
+      ws.sessionId = sess.id;
+      sess.workspaceId = ws.id;
+      const rt = new WorkspaceRuntime({ ws, session: sess, ctx: runtimeCtx });
+      rt.renderSession();
+      workspaces.set(ws.id, { ws, rt });
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    renderWsBar();
+    const rt = activeRuntime();
+    if (rt) syncHeader(rt);
+  }
+}
+
+// ===== 确认卡片的"执行 / 取消"：事件委托 =====
+//
+// 为什么用委托而不是给按钮挂监听器：侧栏会在切换标签页、同步会话等时机
+// **重建整份消息列表**（renderSession），卡片是新建出来的，旧监听器随之消失 ——
+// 于是出现"执行/取消 还显示着、点了却没反应"（用户实际报过）。
+// 委托挂在 document 上，卡片无论怎么重建都点得到。
+function bindConfirmDelegate() {
+  document.addEventListener(
+    "click",
+    (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest(".ok-btn, .cancel-btn") : null;
+      if (!btn) return;
+      const card = btn.closest(".tool-card");
+      if (!card || !card.classList.contains("pending")) return;
+      const wsId = card.dataset.wsId || activeWsId;
+      const entry = workspaces.get(wsId);
+      const rt = entry && entry.rt;
+      if (!rt || typeof rt.pendingConfirm !== "function") return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const ok = btn.classList.contains("ok-btn");
+      const finish = rt.pendingConfirm;
+      // 立刻给视觉反馈（不然用户会以为没点到，反复点）
+      card.classList.remove("pending");
+      card.classList.add(ok ? "running" : "cancelled");
+      const actions = card.querySelector(".tool-actions");
+      const res = card.querySelector(".tool-result");
+      if (actions) actions.innerHTML = ok ? "<span class='tool-detail'>执行中…</span>" : "<span class='tool-detail'>已取消</span>";
+      if (!ok && res) {
+        res.hidden = false;
+        res.textContent = "已取消：你取消了这一步";
+      }
+      finish(ok);
+    },
+    true // capture：抢在卡片自身（如果有）之前处理，且不受冒泡被挡影响
+  );
+}
+
+// 工作区列表被别处改了 → 重读列表，并**只做必要**的视图调整。
+//
+// ⚠️ 千万别在这里直接调 refreshActive()：那会按"当前活动标签页"重算视图，
+//    而这个面板自己也是个标签页 —— 一旦它此刻不是活动页，就会把正在显示的
+//    工作区视图拆成"空对话"（后台任务横条、正在看的会话一起没，测试抓到过）。
+//    这里只处理一件事：**当前这一页现在有主了**（比如 AI 刚把它并进来）→ 切过去。
+async function resyncActiveView() {
+  await reloadWorkspaces();
+  const cur = await activeTab();
+  const tabId = cur?.id ?? null;
+  const ws = wsOfTab(tabId);
+  if (ws) {
+    pendingTabId = tabId;
+    if (activeWsId !== ws.id) {
+      activateWorkspace(ws.id);
+      await refreshCtxInfo();
+    } else {
+      const rt = workspaces.get(ws.id)?.rt;
+      if (rt) syncHeader(rt);
+    }
+    return;
+  }
+  if (activeWsId == null && tabId != null) {
+    pendingTabId = tabId;
+    activatePending(tabId, cur);
+  }
 }
 
 // 恢复上次的工作区（侧栏刷新/重开不该丢）

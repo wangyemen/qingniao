@@ -99,10 +99,18 @@
         <div class="panel-head">
           <h2>我的技能</h2>
           <div class="row">
+            <button id="importSkillBtn" class="tiny">导入 .md</button>
             <button id="newSkillBtn" class="primary">新建技能</button>
             <button id="exportAllBtn" class="tiny">全部导出</button>
           </div>
         </div>
+        <!-- 拖拽导入：把导出的 <id>-SKILL.md（或任何 SKILL.md）拖进来即可。
+             也支持一次拖多个、或把一批文件拖在整块区域上。 -->
+        <div id="skillDrop" class="drop-zone" tabindex="0">
+          <b>把技能的 <code>.md</code> 文件拖到这里</b>
+          <span>支持一次拖入多个；也可以点「导入 .md」选文件，或直接粘贴 SKILL.md 内容到下面的编辑器里再保存。</span>
+        </div>
+        <input id="skillFileInput" type="file" accept=".md,.markdown,.txt,text/markdown" multiple hidden />
         <p class="hint" id="mineMeta"></p>
         <div id="mineList" class="cards"></div>
       </section>
