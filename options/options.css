@@ -462,6 +462,31 @@ button.tiny {
 .chip-official { border-color: rgba(45, 212, 191, 0.45) !important; color: #8ff0e3 !important; }
 .chip-user { border-color: rgba(245, 158, 11, 0.45) !important; color: #f0b866 !important; }
 
+/* ===== 投稿记录（editToken 默认显示在这里）===== */
+.submit-box {
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px dashed var(--border-strong, #3a3f46);
+  border-radius: 9px;
+  background: rgba(45, 212, 191, 0.05);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.submit-line { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.submit-label { color: var(--text-faint, #8b949e); font-size: 12px; }
+.submit-time { color: var(--text-faint, #8b949e); font-size: 11.5px; }
+.submit-token {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  background: var(--bg-elev, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--border, #3a3f46);
+  border-radius: 6px;
+  padding: 2px 6px;
+  color: var(--text, #e6edf3);
+  user-select: all;
+}
+
 /* ===== 技能拖拽导入 ===== */
 .drop-zone {
   display: flex;

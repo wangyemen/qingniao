@@ -74,6 +74,11 @@ const server = http.createServer((req, res) => {
         `## 什么时候用\n\n用户说"跑一下 ${s.title}"的时候。\n\n## 步骤\n\n1. 第一步\n2. 第二步\n`
     );
   }
+  if (url.pathname.endsWith("/manage.php")) {
+    const act = url.searchParams.get("action") || "status";
+    if (act === "delete") return json({ ok: true, action: "delete", message: "已撤回你的投稿" });
+    return json({ ok: true, status: "approved", reviewNote: "" });
+  }
   if (url.pathname.endsWith("/submit.php")) {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -207,6 +212,12 @@ try {
     await chrome.storage.local.set({ ai_skills: skillsMap });
   });
   await sleep(900);
+  // 切到「技能市场」面板（否则「我的技能」那些卡片是隐藏的，量不到高度 —— 别把"隐藏"误判成"没显示"）
+  await page.evaluate(() => {
+    const nav = document.querySelector('.nav-item[data-pane="skills"]');
+    if (nav) nav.click();
+  });
+  await sleep(600);
   const clicked = await page.evaluate(() => {
     const cards = [...document.querySelectorAll("#mineList .card")];
     const card = cards.find((c) => c.textContent.includes("我的测试技能"));
@@ -228,7 +239,55 @@ try {
   const statusText = await page.evaluate(() => (document.getElementById("marketStatus") || {}).textContent || "");
   check("界面提示投稿结果（含 editToken）", /待审核|editToken|已提交/.test(statusText), statusText.slice(0, 90));
 
-  // ---------- ⑥ 官方市场不受影响（还是那套 GitHub 逻辑）----------
+  // ---------- ⑦ editToken：默认显示出来，且能查状态 / 撤回 ----------
+  const tokenShown = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll("#mineList .card")];
+    const card = cards.find((c) => c.textContent.includes("我的测试技能"));
+    if (!card) return null;
+    const box = card.querySelector(".submit-box");
+    const code = card.querySelector(".submit-token");
+    return {
+      hasBox: !!box,
+      tokenText: code ? code.textContent.trim() : "",
+      hasCopy: !!box && [...box.querySelectorAll("button")].some((b) => /复制/.test(b.textContent)),
+      hasStatus: !!box && [...box.querySelectorAll("button")].some((b) => /查状态/.test(b.textContent)),
+      hasWithdraw: !!box && [...box.querySelectorAll("button")].some((b) => /撤回/.test(b.textContent)),
+      visible: !!box && box.getBoundingClientRect().height > 0,
+    };
+  });
+  check("★ 投稿后 editToken **默认显示在卡片上**（不是只丢进剪贴板）", tokenShown && tokenShown.hasBox && tokenShown.visible && /^tok-/.test(tokenShown.tokenText), JSON.stringify(tokenShown));
+  check("卡片上有 复制 / 查状态 / 撤回投稿 三个入口", tokenShown && tokenShown.hasCopy && tokenShown.hasStatus && tokenShown.hasWithdraw, JSON.stringify(tokenShown));
+
+  // 查状态 → 打到 manage.php，并把状态显示出来
+  await page.evaluate(() => {
+    const card = [...document.querySelectorAll("#mineList .card")].find((c) => c.textContent.includes("我的测试技能"));
+    const btn = card && [...card.querySelectorAll("button")].find((b) => /查状态/.test(b.textContent));
+    if (btn) btn.click();
+  });
+  await sleep(1500);
+  const statusAfter = await page.evaluate(() => (document.getElementById("marketStatus") || {}).textContent || "");
+  check("查状态：拿到服务端状态并显示", /投稿状态|已上架|待审核/.test(statusAfter), statusAfter.slice(0, 80));
+
+  // 撤回投稿 → 打到 manage.php 的 delete
+  page.on("dialog", async (d) => {
+    try {
+      await d.accept();
+    } catch (_) {}
+  });
+  await page.evaluate(() => {
+    const card = [...document.querySelectorAll("#mineList .card")].find((c) => c.textContent.includes("我的测试技能"));
+    const btn = card && [...card.querySelectorAll("button")].find((b) => /撤回/.test(b.textContent));
+    if (btn) btn.click();
+  });
+  await sleep(1600);
+  const withdrawn = await page.evaluate(async () => {
+    const all = await chrome.storage.local.get(null);
+    const s = (all.ai_skills || {})["my-publish-test"];
+    return { status: (s && s.marketSubmit && s.marketSubmit.status) || "", text: (document.getElementById("marketStatus") || {}).textContent || "" };
+  });
+  check("撤回投稿：服务端收到 delete 且本地状态变成 withdrawn", withdrawn.status === "withdrawn", JSON.stringify(withdrawn));
+
+  // ---------- ⑧ 官方市场不受影响（还是那套 GitHub 逻辑）----------
   await page.evaluate(() => document.getElementById("tabOfficial").click());
   await sleep(600);
   const back = await page.evaluate(() => ({

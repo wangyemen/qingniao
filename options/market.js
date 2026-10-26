@@ -263,9 +263,13 @@ function marketCard(m) {
   card.appendChild(el("p", "card-desc", m.description || "（作者没有写说明）"));
 
   const meta = el("div", "card-meta");
-  // 来源徽标：一眼分清"官方维护"和"社区投稿（未官方审核）"
+  // 来源徽标：一眼分清"官方维护"和"社区投稿"。
+  // ⚠️ 别写"未审核" —— 用户市场接口**只返回审核通过（status=approved）**的条目，
+  //    写"未审核"会让人以为没审过（用户就报过"我明明通过了，插件还显示未审核"）✗。
   const fromUser = isUserMarket() || m.market === "user";
-  meta.appendChild(el("span", "chip " + (fromUser ? "chip-user" : "chip-official"), fromUser ? "用户投稿 · 未审核" : "官方"));
+  meta.appendChild(
+    el("span", "chip " + (fromUser ? "chip-user" : "chip-official"), fromUser ? "用户投稿 · 已过审" : "官方")
+  );
   if (m.author) meta.appendChild(el("span", "chip", "作者 " + m.author));
   for (const t of m.tags) meta.appendChild(el("span", "chip", t));
   card.appendChild(meta);
@@ -416,6 +420,47 @@ function mineCard(s) {
   for (const t of s.tags || []) meta.appendChild(el("span", "chip", t));
   card.appendChild(meta);
 
+  // 投稿记录：**editToken 默认显示在这里**（只有你自己这台机器上有 ✓）
+  // 作用：改 / 撤自己的投稿、查审核状态。丢了只能重新投，所以别删这行。
+  const ms = s.marketSubmit;
+  if (ms && (ms.token || ms.status)) {
+    const box = el("div", "submit-box");
+    const line1 = el("div", "submit-line");
+    const stateText =
+      ms.status === "approved" ? "已上架" : ms.status === "rejected" ? "被退回" : ms.status === "hidden" ? "已下架" : "待审核";
+    line1.appendChild(el("span", "chip " + (ms.status === "approved" ? "chip-official" : "chip-user"), "投稿：" + stateText));
+    if (ms.slug) line1.appendChild(el("code", "", ms.slug));
+    if (ms.at) line1.appendChild(el("span", "submit-time", new Date(ms.at).toLocaleString()));
+    box.appendChild(line1);
+
+    if (ms.token) {
+      const line2 = el("div", "submit-line");
+      line2.appendChild(el("span", "submit-label", "editToken"));
+      const code = el("code", "submit-token", ms.token);
+      code.title = "凭它改/撤投稿；只有你自己看得到";
+      line2.appendChild(code);
+      const copy = el("button", "tiny", "复制");
+      copy.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(ms.token);
+          setStatus("editToken 已复制", "ok");
+        } catch (_) {
+          setStatus("复制失败，请手动选中复制", "err");
+        }
+      });
+      line2.appendChild(copy);
+      // 查状态 / 撤回（都打自己的服务端 manage.php，靠 token 授权）
+      const st = el("button", "tiny", "查状态");
+      st.addEventListener("click", () => manageSubmission(s, "status", st));
+      line2.appendChild(st);
+      const del = el("button", "tiny danger", "撤回投稿");
+      del.addEventListener("click", () => manageSubmission(s, "delete", del));
+      line2.appendChild(del);
+      box.appendChild(line2);
+    }
+    card.appendChild(box);
+  }
+
   const foot = el("div", "card-foot");
   foot.appendChild(el("span", "state " + (s.enabled === false ? "" : "ok"), s.enabled === false ? "已停用" : "已启用"));
 
@@ -462,6 +507,52 @@ function mineCard(s) {
   foot.appendChild(actions);
   card.appendChild(foot);
   return card;
+}
+
+// 投稿者的自助操作（查状态 / 撤回）—— 用投稿时拿到的 editToken 去服务端 manage.php
+async function manageSubmission(s, action, btn) {
+  const ms = s.marketSubmit || {};
+  if (!ms.token) return setStatus("这条没有 editToken（可能是从官网投的，去官网那次提交结果里找）", "err");
+  const url = (ms.url || USER_MARKET_DEFAULT).replace(/(?:market|submit)\.php.*$/i, "manage.php");
+  if (action === "delete" && !confirm(`撤回投稿「${s.title || s.id}」？\n（会把服务端那条删掉；本地这个技能不受影响）`)) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = action === "delete" ? "撤回中…" : "查询中…";
+  }
+  try {
+    if (action === "delete") {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug: ms.slug || s.id, editToken: ms.token, action: "delete" }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!j || !j.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+      await upsertSkill({ id: s.id, marketSubmit: { ...ms, status: "withdrawn", at: Date.now() } });
+      skills = await loadSkills();
+      renderMine();
+      setStatus("已撤回投稿：" + (s.title || s.id), "ok");
+      return;
+    }
+    const r = await fetch(`${url}?slug=${encodeURIComponent(ms.slug || s.id)}&token=${encodeURIComponent(ms.token)}&action=status`, {
+      cache: "no-store",
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!j || !j.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+    const stateText =
+      j.status === "approved" ? "已上架（用户市场里能看到）" : j.status === "rejected" ? "被退回：" + (j.reviewNote || "无原因") : j.status === "hidden" ? "已下架" : "待审核";
+    await upsertSkill({ id: s.id, marketSubmit: { ...ms, status: j.status || ms.status } });
+    skills = await loadSkills();
+    renderMine();
+    setStatus("投稿状态：" + stateText, "ok");
+  } catch (err) {
+    setStatus((action === "delete" ? "撤回失败：" : "查询失败：") + ((err && err.message) || err), "err");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = action === "delete" ? "撤回投稿" : "查状态";
+    }
+  }
 }
 
 async function exportAll() {
@@ -511,15 +602,23 @@ async function submitSkillToUserMarket(s, btn) {
     const j = await res.json().catch(() => ({}));
     if (!j || !j.ok) throw new Error((j && j.error) || ("HTTP " + res.status));
     let tip = j.updated ? "已更新你之前投的那条，重新进入待审核" : "已提交，等待审核";
-    if (j.editToken) {
+    // editToken **默认显示出来**（用户要求）：先存进这条技能里，卡片上会有一栏随时能看、能复制。
+    // 只有提交者自己看得到 —— 服务端的公开接口（market.php / skill.php）一条都不吐 token ✓，
+    // 它只在本机这份记录里，以及你自己的提交结果里出现。
+    const slug = j.slug || payload.slug;
+    const token = j.editToken || "";
+    await upsertSkill({
+      id: s.id,
+      marketSubmit: { at: Date.now(), status: j.status || "pending", url: submitUrl, slug, token, updated: !!j.updated },
+    });
+    if (token) {
       try {
-        await navigator.clipboard.writeText(j.editToken);
-        tip += "（editToken 已复制到剪贴板，请收好：凭它改/撤投稿）";
+        await navigator.clipboard.writeText(token);
+        tip += "（editToken 已显示在下方的技能卡片上，并已复制到剪贴板 · 请收好：凭它改/撤投稿）";
       } catch (_) {
-        tip += "（editToken：" + j.editToken + " —— 请自己保存）";
+        tip += "（editToken 已显示在下方的技能卡片上 · 请自己保存）";
       }
     }
-    await upsertSkill({ id: s.id, marketSubmit: { at: Date.now(), status: j.status || "pending", url: submitUrl } });
     skills = await loadSkills();
     renderMine();
     setStatus("✅ " + tip, "ok");
