@@ -24,7 +24,7 @@ const TAGS = ["section", "article", "div", "ul", "li", "p", "a", "table", "tbody
 const TAGS_RE = new RegExp("<(" + TAGS.join("|") + ")\\b", "g");
 const TAGS_CLOSE_RE = new RegExp("</(" + TAGS.join("|") + ")>", "g");
 
-const VERSIONS = ["0.4.4", "0.4.3", "0.4.2", "0.4.1", "0.4.0"];
+const VERSIONS = ["0.4.5", "0.4.4", "0.4.3", "0.4.2", "0.4.1", "0.4.0"];
 
 for (const f of FILES) {
   const t = readFileSync(f, "utf8");
