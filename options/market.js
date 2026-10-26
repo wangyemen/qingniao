@@ -655,6 +655,10 @@ async function submitSkillToUserMarket(s, btn) {
       body: stripSkillMeta(s.body || "").trim(),
       from: "plugin",
       agree: true,
+      // ★ 关键：**带上这条技能的 editToken**（如果有）。
+      //   服务端靠它判断"这是原作者在更新版本"还是"别人下载了再投同一个 id" ✗ ——
+      //   不带的话，作者自己更新也会被判成非法提交 ✓（所以必须传）
+      editToken: (s.marketSubmit && s.marketSubmit.token) || "",
     };
     const res = await fetch(submitUrl, {
       method: "POST",
