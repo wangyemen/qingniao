@@ -80,6 +80,11 @@ const server = http.createServer((req, res) => {
     return json({ ok: true, status: "approved", reviewNote: "" });
   }
   if (url.pathname.endsWith("/submit.php")) {
+    // 和真实服务端一致：只收插件来的（没有 X-QN-Client 就拒）
+    const cli = req.headers["x-qn-client"] || "";
+    if (!/^qingniao\//i.test(cli)) {
+      return json({ ok: false, error: "投稿只支持从扩展提交" }, 403);
+    }
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
@@ -87,7 +92,7 @@ const server = http.createServer((req, res) => {
       try {
         j = JSON.parse(body);
       } catch (_) {}
-      submitted.push(j);
+      submitted.push({ ...(j || {}), client: cli }); // 顺便记下客户端标记，后面要断言
       json({ ok: true, id: 99, slug: (j && j.slug) || "x", status: "pending", editToken: "tok-测试-123", message: "投稿已收到，等待审核" }, 201);
     });
     return;
@@ -231,6 +236,11 @@ try {
   await sleep(1800);
   const post = submitted[submitted.length - 1];
   check("投稿请求发出去了且打到 submit.php", !!post, JSON.stringify(submitted.length));
+  check(
+    "★ 投稿带了 X-QN-Client 标记（服务端只收插件提交，没这个标记会被 403 拒掉）",
+    !!post && /^qingniao\//i.test(post.client || ""),
+    post ? JSON.stringify({ client: post.client }) : "（没收到投稿请求）"
+  );
   check(
     "投稿内容正确（带 from=plugin、agree、正文已剥元数据）",
     post && post.from === "plugin" && post.agree === true && post.slug === "my-publish-test" && !/^\s*name:\s/m.test(post.body || ""),

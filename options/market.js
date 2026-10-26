@@ -596,7 +596,11 @@ async function submitSkillToUserMarket(s, btn) {
     };
     const res = await fetch(submitUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // 服务端只收插件投稿（网页投稿丢了 editToken 就找不回来 ✗）→ 带上客户端标记
+        "X-QN-Client": "qingniao/" + (chrome.runtime.getManifest().version || "0"),
+      },
       body: JSON.stringify(payload),
     });
     const j = await res.json().catch(() => ({}));
