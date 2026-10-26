@@ -1,10 +1,13 @@
 // 从 version.txt 抽取每个版本的段落，生成 GitHub Release 的说明文件（dist/rel-notes-<ver>.md）
 //
-// 用法： node test/_release-notes.mjs
+// 用法： node test/release-notes.mjs            （默认最新版本）
+//        node test/release-notes.mjs 0.4.4 0.4.3（指定版本，可多个）
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 
-const VERSIONS = ["0.4.3", "0.4.2", "0.4.1"];
+const argVersions = process.argv.slice(2).filter((a) => /^\d+\.\d+\.\d+$/.test(a));
+const latestInTxt = (readFileSync("version.txt", "utf8").match(/^latest:\s*(\S+)/m) || [])[1];
+const VERSIONS = argVersions.length ? argVersions : [latestInTxt, "0.4.3", "0.4.2", "0.4.1"].filter(Boolean);
 
 const txt = readFileSync("version.txt", "utf8");
 const lines = txt.split(/\r?\n/);
