@@ -1,8 +1,16 @@
 // 站点体检：标签配平、直链按钮数量、不再有"占位模板"、每个直链真的能下
 //
-// 用法： node test/_site-check.mjs
+// ⚠️ 站点（qingniao.gt.tc/）**不随扩展仓库推送**（用户要求，已加进 .gitignore）。
+//    本地有就跑；克隆仓库的人没有这个目录 → 直接跳过，不算失败。
+//
+// 用法： node test/site-check.mjs
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+
+if (!existsSync("qingniao.gt.tc/index.html")) {
+  console.log("（跳过）本地没有 qingniao.gt.tc/ 站点目录 —— 站点不随扩展仓库推送，属正常");
+  process.exit(0);
+}
 
 let pass = 0,
   fail = 0;
@@ -16,7 +24,7 @@ const TAGS = ["section", "article", "div", "ul", "li", "p", "a", "table", "tbody
 const TAGS_RE = new RegExp("<(" + TAGS.join("|") + ")\\b", "g");
 const TAGS_CLOSE_RE = new RegExp("</(" + TAGS.join("|") + ")>", "g");
 
-const VERSIONS = ["0.4.3", "0.4.2", "0.4.1", "0.4.0"];
+const VERSIONS = ["0.4.4", "0.4.3", "0.4.2", "0.4.1", "0.4.0"];
 
 for (const f of FILES) {
   const t = readFileSync(f, "utf8");

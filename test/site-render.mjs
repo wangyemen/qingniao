@@ -1,13 +1,21 @@
 // 用真实浏览器打开站点，验证"下载按钮"是否真的渲染出来
 // （用户要求：不要显示成长链接，要按钮，点一下直接下载；每个版本都要有）
 //
-// 用法： node test/_site-render.mjs
+// ⚠️ 站点（qingniao.gt.tc/）**不随扩展仓库推送**（用户要求，已加进 .gitignore）。
+//    本地有就跑；克隆仓库的人没有这个目录 → 直接跳过。
+//
+// 用法： node test/site-render.mjs
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { launchEdge } from "./edge-launch.mjs";
+
+if (!fs.existsSync("qingniao.gt.tc/index.html")) {
+  console.log("（跳过）本地没有 qingniao.gt.tc/ 站点目录 —— 站点不随扩展仓库推送，属正常");
+  process.exit(0);
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0,
