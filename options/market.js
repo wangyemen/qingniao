@@ -373,6 +373,8 @@ async function installMarketSkill(m, btn) {
       marketUrl: url,
       marketSource: marketSource || currentSource(),
       marketVersion: m.version,
+      // 记一份"装下来时的快照"：以后判断"这个技能在本地被改过没" ✗（改过就不自动覆盖 ✓）
+      marketSnapshot: { version: m.version, hash: skillHash(body) },
     });
     skills = await loadSkills();
     renderMarket();
@@ -554,6 +556,34 @@ function mineCard(s) {
   submit.title = "把这一个技能提交到官网的用户市场（会先进待审核队列）";
   submit.addEventListener("click", () => submitSkillToUserMarket(s, submit));
   actions.appendChild(submit);
+
+  // —— 市场技能的更新相关（只对"从市场装来的"有意义）——
+  if (s.source === "market") {
+    const edited = isLocallyEdited(s);
+    const auto = el("button", "tiny", s.autoUpdate === false ? "自动更新：关" : "自动更新：开");
+    auto.title = "打开设置页的技能市场时会检查一次；关掉后这个技能就不会被自动更新覆盖";
+    auto.addEventListener("click", async () => {
+      await upsertSkill({ id: s.id, autoUpdate: s.autoUpdate === false });
+      skills = await loadSkills();
+      renderMine();
+      setStatus(`${s.title || s.id}：自动更新已${s.autoUpdate === false ? "打开" : "关闭"}`, "ok");
+    });
+    actions.appendChild(auto);
+
+    const fork = el("button", "tiny", "创建我的版本");
+    fork.title = "把当前内容复制成你自己的技能（新 id）—— 之后自动更新不碰它，你也可以随便改、再自己投稿";
+    fork.addEventListener("click", () => forkSkill(s));
+    actions.appendChild(fork);
+
+    if (edited) {
+      const warn = el("div", "submit-line");
+      warn.appendChild(
+        el("span", "chip chip-user", "本地改过 · 已暂停自动更新")
+      );
+      warn.appendChild(el("span", "submit-label", "想继续跟官方/作者更新？先点「创建我的版本」再改。"));
+      card.appendChild(warn);
+    }
+  }
 
   const del = el("button", "tiny danger", "删除");
   del.addEventListener("click", async () => {
@@ -1245,6 +1275,129 @@ function downloadSkill(skill) {
   downloadText(`${skill.id}-SKILL.md`, skillMarkdown(skill));
   setStatus(`已下载 ${skill.id}-SKILL.md`, "ok");
 }
+
+// ===================== 市场技能的自动更新 / 分支 =====================
+//
+// 规则（跟用户确认过的）：
+//   · 从市场装来的技能，**打开设置页「技能市场」时检查一次**（不做后台定时 ✓）；
+//   · 有新版本就**自动更新**（保留启用/停用状态 ✓）；**每个技能可以单独关掉自动更新** ✓；
+//   · **本地自己改过的技能不覆盖** ✓（正文或版本和上次从市场装的快照不一致 → 跳过并提示 ✓）；
+//   · 想改又想跟着更新 → 提供「**用当前版本创建我自己的版本**」✓：
+//     复制成**你自己的技能（新 id** ✓），从此自动更新不碰它 ✓，也能当成你自己的投稿投出去（拿你自己的 token ✓）。
+function skillHash(s) {
+  const t = String(s || "");
+  let h = 0;
+  for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
+  return "h" + (h >>> 0).toString(16);
+}
+
+// 判断"这个技能在我本地被改过"（跟上次从市场装下来的快照比）
+function isLocallyEdited(s) {
+  const snap = s && s.marketSnapshot;
+  if (!snap || !snap.hash) return false; // 老记录没快照 → 没法判，按"没改过"处理
+  return skillHash(s.body || "") !== snap.hash || String(s.version || "") !== String(snap.version || "");
+}
+
+async function autoUpdateInstalledSkills() {
+  if (!skills) skills = await loadSkills();
+  const ms = await loadMarketSettings().catch(() => ({}));
+  const sources = [
+    { src: String(marketSource || $("sourceInput").value || DEFAULT_MARKET_REPO).trim(), user: false },
+    { src: String(ms.userSource || $("userSourceInput").value || USER_MARKET_DEFAULT).trim(), user: true },
+  ];
+  const updated = [];
+  const skipped = [];
+  for (const { src, user } of sources) {
+    let idx = null;
+    try {
+      idx = await fetchMarketIndex(src);
+    } catch (_) {
+      continue; // 拉不到就跳过，不影响别的
+    }
+    for (const m of idx.index.skills || []) {
+      const local = skills[m.id];
+      if (!local || local.source !== "market") continue;
+      if ((local.market === "user") !== user) continue; // 来源要对得上，别用错市场
+      if (compareVersion(m.version, local.version) <= 0) continue;
+      const name = local.title || local.id;
+      if (local.autoUpdate === false) {
+        skipped.push(`${name}（你关了自动更新）`);
+        continue;
+      }
+      if (isLocallyEdited(local)) {
+        skipped.push(`${name}（你在本地改过，没动它）`);
+        continue;
+      }
+      try {
+        const { text, url } = await fetchSkillMd(idx.bases || idx.base, m);
+        const { meta, body } = parseSkillMd(text);
+        const skill = makeSkill({ meta, body, fallbackId: m.id });
+        await upsertSkill({
+          ...skill,
+          id: local.id, // 用本地这个 id（可能与市场 id 不同：比如装成了 xxx-user）
+          source: "market",
+          market: user ? "user" : "official",
+          enabled: local.enabled !== false, // 保留你的启用/停用状态
+          marketUrl: url,
+          marketSource: src,
+          marketVersion: m.version,
+          marketSnapshot: { version: m.version, hash: skillHash(body) },
+        });
+        updated.push(`${skill.title || local.id} → v${m.version}`);
+      } catch (_) {}
+    }
+  }
+  if (updated.length || skipped.length) {
+    skills = await loadSkills();
+    renderMarket();
+    renderMine();
+    setStatus(
+      (updated.length ? `已自动更新 ${updated.length} 个技能：${updated.join("、")}` : "市场里没有需要更新的技能") +
+        (skipped.length ? `　｜　跳过：${skipped.join("、")}` : ""),
+      "ok"
+    );
+  }
+}
+
+// 用当前版本创建"我自己的版本"（新 id，从此自动更新不碰它）
+async function forkSkill(s) {
+  const base = String(s.id || "skill").replace(/-mine(-\d+)?$/, "");
+  let raw = prompt("给你的版本起一个新 id（小写字母/数字/连字符）：", `${base}-mine`);
+  if (raw === null) return;
+  const id = String(raw).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return setStatus("id 只能用小写字母、数字和连字符（字母/数字开头）", "err");
+  if (skills[id]) return setStatus(`id「${id}」已经被别的技能用了，换一个`, "err");
+  await upsertSkill({
+    id,
+    title: (s.title || s.id) + "（我的版本）",
+    description: s.description || "",
+    version: s.version || "1.0.0",
+    author: s.author || "",
+    tags: s.tags || [],
+    icon: s.icon || "",
+    body: s.body || "",
+    source: "local",
+    enabled: s.enabled !== false,
+    forkedFrom: s.id,
+  });
+  skills = await loadSkills();
+  renderMine();
+  renderMarket();
+  setStatus(
+    `已创建你自己的版本「${(skills[id] && skills[id].title) || id}」（id=${id}）。` +
+      "自动更新不会再碰它，你可以随便改；想发到用户市场就点「投稿到用户市场」（它会用自己的新 id ✓）。",
+    "ok"
+  );
+}
+
+// 打开「技能市场」面板时检查一次自动更新（用户选定的时机 ✓）
+document.addEventListener("click", (ev) => {
+  const t = ev.target && ev.target.closest ? ev.target.closest('.nav-item[data-pane="skills"]') : null;
+  if (!t) return;
+  setTimeout(() => {
+    autoUpdateInstalledSkills().catch(() => {});
+  }, 400);
+});
 
 // ---------- 启动 ----------
 (async function initMarket() {
