@@ -491,8 +491,21 @@ function mineCard(s) {
     const box = el("div", "submit-box");
     const line1 = el("div", "submit-line");
     const stateText =
-      ms.status === "approved" ? "已上架" : ms.status === "rejected" ? "被退回" : ms.status === "hidden" ? "已下架" : "待审核";
-    line1.appendChild(el("span", "chip " + (ms.status === "approved" ? "chip-official" : "chip-user"), "投稿：" + stateText));
+      ms.status === "approved"
+        ? "已上架"
+        : ms.status === "revision_pending"
+          ? "新版本待审核（旧版仍可用）"
+          : ms.status === "revision_rejected"
+            ? "新版本被退回（旧版仍可用）"
+            : ms.status === "rejected"
+              ? "被退回"
+              : ms.status === "hidden"
+                ? "已下架"
+                : ms.status === "withdrawn"
+                  ? "已撤回"
+                  : "待审核";
+    const okish = ms.status === "approved" || ms.status === "revision_pending" || ms.status === "revision_rejected";
+    line1.appendChild(el("span", "chip " + (okish ? "chip-official" : "chip-user"), "投稿：" + stateText));
     if (ms.slug) line1.appendChild(el("code", "", ms.slug));
     if (ms.at) line1.appendChild(el("span", "submit-time", new Date(ms.at).toLocaleString()));
     box.appendChild(line1);
