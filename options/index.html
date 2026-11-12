@@ -68,6 +68,43 @@
         以免超出模型上限。默认 128000 tokens / 90%。
       </p>
     </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>浏览器弹窗（alert / confirm / prompt / 离开确认）</h2>
+      </div>
+      <div class="row">
+        <label class="field grow">
+          <span>接管方式</span>
+          <select id="dialogMode">
+            <option value="ai">只在 AI 操控那一页时接管（推荐）</option>
+            <option value="auto">始终接管（你自己点出来的也不弹，改成页面里的提示条）</option>
+            <option value="off">不接管（保持浏览器原生行为）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label class="field">
+          <span>确认框 confirm 的默认答案</span>
+          <select id="dialogConfirmAccept">
+            <option value="false">取消（推荐：不替你点「确定」）</option>
+            <option value="true">确定</option>
+          </select>
+        </label>
+        <label class="field grow">
+          <span>输入框 prompt 的默认答案</span>
+          <input type="text" id="dialogPromptText" placeholder="留空 = 取消；填了就用这段文字应答" />
+        </label>
+      </div>
+      <p class="hint">
+        这几种框是<b>浏览器画的、不在网页里</b>：元素列表、无障碍树都读不到它，而且它一出现会把整页 JS
+        <b>按住</b>——以前表现就是「AI 点了个按钮，侧栏像死掉」。接管之后青鸟会<b>照实记下弹了什么、替你答了什么</b>，
+        在页面左下角给你一条提示，然后立刻放行；AI 还可以「先预设答案、再去点那个按钮」，
+        也能把「等页面弹出某个框」挂成后台任务。<br />
+        接管只覆盖 alert / confirm / prompt / 离开确认这四种；<b>文件选择框、打印框</b>是系统级弹窗，
+        接管不到 —— 真卡在那儿时会明确告诉你（侧栏也不会再干等，读页面超过十几秒就撒手报情况）。
+      </p>
+    </section>
     </div><!-- /pane-settings -->
 
     <!-- ===================== 技能市场 ===================== -->

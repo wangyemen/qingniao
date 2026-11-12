@@ -1083,6 +1083,7 @@
 
 
   function snapshot(max) {
+    beat("act"); // AI 来读页面了 → 续上"这页正被 AI 操控"的心跳（弹窗接管靠它判断该不该插手）
     const cap = typeof max === "number" && max > 0 ? max : MAX_ELEMENTS;
     idxMap.clear(); // 重新编号，保证编号与本次快照严格对应
     const found = deepQuery(INTERACTIVE_SEL);
@@ -1240,6 +1241,9 @@
       total: deduped.length, // 页面上可交互元素总数（列表被截断时告诉模型）
       truncated: deduped.length > list.length,
       scrollY: Math.round(window.scrollY),
+      // 浏览器原生弹窗的账本（DOM 之外的那几种框）+ 接管状态：侧栏据此告诉 AI 刚才弹了什么、答了什么
+      dialogs: dlgList(8),
+      dialogState: dlgState(),
     };
   }
 
@@ -1587,6 +1591,11 @@
         cleanup();
       } catch (_) {}
     }
+    // 这页最后一个后台任务没了 → 心跳收回，弹窗重新还给用户（AI 不在干活，不该继续替它答）
+    if (!deferWatchers.size && deferAliveMs) {
+      deferAliveMs = 0;
+      beat("idle");
+    }
   }
 
   function fireDefer(taskId, reason) {
@@ -1693,11 +1702,63 @@
       const sec = Math.min(86400, Math.max(1, Number(until.seconds) || 30));
       const t = setTimeout(() => fireDefer(taskId, `定时唤醒（${sec} 秒）`), sec * 1000);
       cleanups.push(() => clearTimeout(t));
+    } else if (type === "dialog") {
+      // 等页面弹出**浏览器原生对话框**（alert / confirm / prompt / 离开确认）。
+      // 典型用法：用户点某一步会跳出一句提示，要等它出来了才知道成没成 ——
+      // 这种框不在 DOM 里，页面文字读不到它，只能等钩子把它记进账本（data-qn-dlg-log）。
+      const wantKind = String(until.kind || "").toLowerCase();
+      const q = norm(until.text || a.text || "").toLowerCase();
+      const hits = (items) =>
+        items.filter(
+          (it) =>
+            (!wantKind || String(it.kind) === wantKind) &&
+            (!q || norm(String(it.msg || "")).toLowerCase().includes(q))
+        );
+      const base = dlgList(0).reduce((m, it) => Math.max(m, Number(it.seq) || 0), 0);
+      const fresh = hits(dlgList(0)).filter((it) => Date.now() - (Number(it.at) || 0) < 15000);
+      if (fresh.length) {
+        const it = fresh[fresh.length - 1];
+        setTimeout(
+          () => fireDefer(taskId, `页面上已经弹出过 ${DLG_KIND_CN[it.kind] || it.kind}「${clip(it.msg, 40)}」`),
+          0
+        );
+      } else {
+        const mo = new MutationObserver(() => {
+          const items = dlgList(0);
+          if (!items.some((it) => (Number(it.seq) || 0) > base)) return;
+          const m = hits(items.filter((it) => (Number(it.seq) || 0) > base));
+          if (!m.length) return;
+          const it = m[m.length - 1];
+          fireDefer(taskId, `页面弹出了 ${DLG_KIND_CN[it.kind] || it.kind}「${clip(it.msg, 40)}」→ ${it.answer || "已处理"}`);
+        });
+        try {
+          mo.observe(document.documentElement || document, {
+            attributes: true,
+            attributeFilter: ["data-" + DLG_LOG],
+          });
+          cleanups.push(() => mo.disconnect());
+        } catch (_) {}
+        // 子框架里的弹窗只能靠 bridge 实时转告：这里再挂一个消息监听兜住（同源框架的账本变化上面已覆盖）
+        try {
+          const onMsg = (msg) => {
+            if (!msg || msg.type !== "dialog:event" || !msg.ev) return;
+            const it = msg.ev;
+            const m = hits([it]);
+            if (m.length) fireDefer(taskId, `页面（框架）弹出了 ${DLG_KIND_CN[it.kind] || it.kind}「${clip(it.msg, 40)}」`);
+          };
+          chrome.runtime.onMessage.addListener(onMsg);
+          cleanups.push(() => {
+            try {
+              chrome.runtime.onMessage.removeListener(onMsg);
+            } catch (_) {}
+          });
+        } catch (_) {}
+      }
     } else {
       return {
         ok: false,
         msg: `未知的等待条件类型：${type}`,
-        hint: "until.type 只支持 video-ended / text-appear / element-appear / timeout。",
+        hint: "until.type 只支持 video-ended / text-appear / element-appear / dialog / timeout。",
       };
     }
 
@@ -1708,6 +1769,9 @@
         } catch (_) {}
       }
     });
+    // 后台任务挂在这页上的这段时间，弹窗接管要一直有效（否则框被还给用户，条件永远等不到）
+    deferAliveMs = Math.min(86400, Math.max(10, Number(a.timeoutSec) || 1800)) * 1000;
+    beat("act");
     return {
       ok: true,
       deferred: true,
@@ -2269,6 +2333,8 @@
 
   async function actInner(a) {
     if (!a || typeof a !== "object") return { ok: false, msg: "动作无效" };
+    beat("act"); // 同 snapshot：AI 动手了，心跳要续上（否则这页正要弹的框会被还给用户）
+    if (a.action === "dialog") return dialogAct(a);
     const needTarget = ["click", "fill", "select", "check", "extract", "focus"].includes(a.action);
     let el = null;
     if (needTarget || a.target != null) {
@@ -2704,9 +2770,13 @@
   const BANNER_ID = "__ai_ctl_banner";
 
   function banner(show, text) {
+    // 横条开/关就是"AI 在不在这页干活"最准的时机：
+    // 开 → 续心跳（这页的 alert/confirm/离开确认由青鸟接管）；关 → 还给用户（后台任务还挂着时不断）
+    if (show) beat("act");
     const old = document.getElementById(BANNER_ID);
     if (!show) {
       if (old) old.remove();
+      beat("idle");
       return true;
     }
     if (old) return true;
@@ -2915,9 +2985,292 @@
     return res;
   }
 
+  // ===== 浏览器原生弹窗（alert / confirm / prompt / 「离开站点？」）=====
+  //
+  // 为什么需要：这四种框是**浏览器自己画的**，不在 DOM 里，而且一出现就把整页 JS 按住 ——
+  // 侧栏既看不见它、也点不到它，注入读取全部卡到超时（表现就是"AI 点了个按钮之后侧栏死在那"）。
+  // content/dialog-hook.js（页面世界）负责把框接管掉、同步给一个答案，并把过程写进这本账；
+  // 这边（隔离世界）做三件事：把账交给侧栏/AI、把 AI 预设的答案交给钩子、
+  // 以及用"心跳"告诉钩子"AI 正在这页干活"（接管只在干活期间发生，用户自己浏览时不插手）。
+  const DLG_CFG = "qn-dlg-cfg";
+  const DLG_CTL = "qn-dlg-ctl";
+  const DLG_LIVE = "qn-dlg-live";
+  const DLG_LOG = "qn-dlg-log";
+  const DLG_ENV = "qn-dlg-env";
+  const AI_BEAT_MS = 90000; // 心跳窗口：面板没了，90 秒后自动把弹窗还给用户
+  const ARM_MS = 30000; // AI 预设答案的有效期（下了注但页面迟迟没弹 → 过期作废）
+  let deferAliveMs = 0; // 最近一个后台任务还要等多久（用来延长心跳窗口）
+
+  function dlgAttr(name) {
+    const el = document.documentElement || document;
+    try {
+      return el && el.getAttribute ? el.getAttribute("data-" + name) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function dlgJson(name) {
+    const raw = dlgAttr(name);
+    if (!raw) return {};
+    try {
+      const o = JSON.parse(raw);
+      return o && typeof o === "object" ? o : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  // 子框架也有自己的钩子，所以"AI 心跳 / 预设答案 / 清账"要写给它一份（同源才写得进去）
+  function dlgSetEach(name, obj) {
+    let txt = null;
+    try {
+      txt = JSON.stringify(obj);
+    } catch (_) {
+      return;
+    }
+    try {
+      (document.documentElement || document).setAttribute("data-" + name, txt);
+    } catch (_) {}
+    try {
+      for (const f of document.querySelectorAll("iframe,frame")) {
+        let doc = null;
+        try {
+          doc = f.contentDocument;
+        } catch (_) {
+          continue;
+        }
+        try {
+          if (doc && doc.documentElement) doc.documentElement.setAttribute("data-" + name, txt);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  // 心跳（写在 data-qn-dlg-live，与"预设答案"那本分开 —— 见 dialog-hook.js 顶部说明）：
+  // act / snapshot / probe 都会续一下（这几条路只有 AI 在操作这页时才走）。
+  // kind="idle"（本轮干完、横条收起）**不是立刻收回，而是留 20 秒收尾窗口**：
+  //   ① "点完 → 一秒后页面才弹出『保存成功』"太常见了，那一下其实是 AI 这一步的尾巴；
+  //   ② 自动化循环里 probe 每轮都会续，不留这个窗口就会出现"两轮之间有一瞬不接管"的空隙。
+  // 20 秒后没人再续 → 自动把弹窗还给用户（面板崩了也一样会自己过期）。
+  const IDLE_GRACE_MS = 20000;
+  function beat(kind) {
+    let live;
+    try {
+      live = dlgJson(DLG_LIVE);
+    } catch (_) {
+      return;
+    }
+    const armed = deferWatchers.size > 0;
+    if (kind === "idle") {
+      if (armed) return;
+      live.ai = 1;
+      live.at = Date.now();
+      live.ttl = IDLE_GRACE_MS;
+      dlgSetEach(DLG_LIVE, live);
+      return;
+    }
+    live.ai = 1;
+    live.at = Date.now();
+    live.ttl = armed ? Math.min(600000, Math.max(AI_BEAT_MS, (deferAliveMs || 0) + 20000)) : AI_BEAT_MS;
+    dlgSetEach(DLG_LIVE, live);
+  }
+
+  function dlgItemsOf(el) {
+    try {
+      const st = JSON.parse((el && el.getAttribute ? el.getAttribute("data-" + DLG_LOG) : null) || "{}");
+      return Array.isArray(st.items) ? st.items : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // 账本按框架各记各的（钩子跑在每个框架的页面世界里），这里顺手把**同源**子框架并进来。
+  // 跨域框架读不到 DOM —— 那部分由 dialog-bridge.js 实时转告侧栏，不会丢。
+  function dlgList(max) {
+    const out = [];
+    try {
+      out.push(...dlgItemsOf(document.documentElement || document));
+    } catch (_) {}
+    try {
+      for (const f of document.querySelectorAll("iframe,frame")) {
+        let doc = null;
+        try {
+          doc = f.contentDocument;
+        } catch (_) {
+          continue; // 跨域：访问 contentDocument 直接抛
+        }
+        if (!doc || !doc.documentElement) continue;
+        const tag = clip(f.src || f.getAttribute("src") || f.name || "iframe", 26);
+        for (const it of dlgItemsOf(doc.documentElement)) {
+          out.push(it.frame ? it : Object.assign({}, it, { frame: "框架:" + tag }));
+        }
+      }
+    } catch (_) {}
+    out.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0));
+    return max ? out.slice(-max) : out;
+  }
+
+  const DLG_KIND_CN = {
+    alert: "提示框 alert",
+    confirm: "确认框 confirm",
+    prompt: "输入框 prompt",
+    beforeunload: "离开页面确认",
+  };
+
+  function dlgState() {
+    const cfg = dlgJson(DLG_CFG);
+    const live = dlgJson(DLG_LIVE);
+    const ctl = dlgJson(DLG_CTL);
+    const env = dlgJson(DLG_ENV);
+    const mode = cfg.mode === "auto" || cfg.mode === "off" ? cfg.mode : "ai";
+    const ttl = Math.min(600000, Math.max(15000, Number(live.ttl) || AI_BEAT_MS));
+    const aiOn = live.ai === 1 && Date.now() - (Number(live.at) || 0) < ttl;
+    const hooked = env.hook === 1;
+    const miss = [];
+    if (!hooked) miss.push("钩子");
+    else {
+      for (const k of ["alert", "confirm", "prompt", "unload"]) {
+        if (env[k] === false) miss.push(k);
+      }
+    }
+    return {
+      hooked,
+      mode,
+      aiOn,
+      // 真在接管 = 钩子在 + 当前模式/心跳允许
+      taking: hooked && (mode === "auto" || (mode === "ai" && aiOn)),
+      confirmAccept: cfg.confirmAccept === true,
+      promptText: typeof cfg.promptText === "string" ? cfg.promptText : "",
+      arm: ctl.arm
+        ? { kind: String(ctl.arm.kind || "any"), accept: ctl.arm.accept === true, text: ctl.arm.text }
+        : null,
+      miss,
+    };
+  }
+
+  function dlgStateLine(st) {
+    if (!st.hooked) {
+      return "接管钩子没装在这页上（扩展安装/更新之前就打开的页面不会有）—— 刷新该页即可（AI 自己 navigate 回同一网址也算）";
+    }
+    const modeCn = st.mode === "auto" ? "始终接管" : st.mode === "off" ? "不接管（浏览器原生）" : "AI 操控时接管";
+    if (st.mode === "off") return "接管已关闭（" + modeCn + "）";
+    if (!st.taking) return "接管未生效：模式=" + modeCn + "，但当前没有 AI 心跳";
+    const bits = ["模式=" + modeCn];
+    if (st.miss.length) bits.push("这几样没接管成功：" + st.miss.join("/"));
+    if (st.arm) {
+      bits.push(
+        "已预设下一个" +
+          (DLG_KIND_CN[st.arm.kind] || st.arm.kind || "弹窗") +
+          "的答案：" +
+          (st.arm.kind === "prompt" ? "填入「" + String(st.arm.text ?? "").slice(0, 30) + "」" : st.arm.accept ? "确定" : "取消")
+      );
+    }
+    return bits.join("；");
+  }
+
+  function dlgLine(it) {
+    const t = new Date(Number(it.at) || 0);
+    const hh = String(t.getHours()).padStart(2, "0") + ":" + String(t.getMinutes()).padStart(2, "0") + ":" + String(t.getSeconds()).padStart(2, "0");
+    const what = String(it.msg || "（空内容）").replace(/\s+/g, " ").slice(0, 120);
+    const fr = it.frame ? " · " + it.frame : "";
+    return `  · [${it.seq}] ${hh}${fr} ${DLG_KIND_CN[it.kind] || it.kind}「${what}」→ ${it.answer || "?"}（${it.by || "自动"}）`;
+  }
+
+  // AI 的 dialog 动作：看账 / 预设答案 / 撤预设 / 清账
+  function dialogAct(a) {
+    const op = String(a.op || "list").toLowerCase();
+    const st = dlgState();
+    if (op === "arm") {
+      if (!st.hooked) {
+        return {
+          ok: false,
+          msg: "这一页没有装上弹窗接管钩子，预设答案没人执行",
+          hint:
+            "扩展安装/更新之前就打开的页面不带钩子。这页没有未保存的输入时，可以直接 " +
+            '{"action":"navigate","url":"当前网址"} 重载一次（重载后就有钩子了）；' +
+            "表单填了一半就先别重载，跟用户说一声让他决定。",
+        };
+      }
+      const wantKind = a.kind ? String(a.kind).toLowerCase() : a.value != null && a.accept === undefined ? "prompt" : "confirm";
+      const kind = DLG_KIND_CN[wantKind] ? wantKind : "confirm";
+      if (kind === "alert" || kind === "beforeunload") {
+        return {
+          ok: false,
+          msg: `${DLG_KIND_CN[kind]} 不需要预设答案：它没有"回答"，接管时直接关掉/放行`,
+          hint: '要预设的是 confirm（{"op":"arm","accept":true}）和 prompt（{"op":"arm","value":"要填的文字"}）。',
+        };
+      }
+      const ctl = dlgJson(DLG_CTL);
+      const accept = a.accept === true || a.accept === "true" || a.value === true;
+      const text = kind === "prompt" ? (a.value == null ? "" : String(a.value).slice(0, 500)) : undefined;
+      if (kind === "prompt" && a.value == null) {
+        return {
+          ok: false,
+          msg: "预设 prompt 的答案需要给 value（要填进输入框的文字；要它取消就别预设 prompt）",
+          hint: '例如 {"action":"dialog","op":"arm","kind":"prompt","value":"张三"}',
+        };
+      }
+      ctl.arm = { kind, accept: kind === "confirm" ? accept : true, at: Date.now(), ms: ARM_MS };
+      if (text != null) ctl.arm.text = text;
+      dlgSetEach(DLG_CTL, ctl);
+      const ans = kind === "prompt" ? "填入「" + clip(text, 40) + "」" : accept ? "确定" : "取消";
+      return {
+        ok: true,
+        msg: `已预设：这页下一个 ${DLG_KIND_CN[kind]} 会回答「${ans}」（${ARM_MS / 1000} 秒内有效，用掉即失效）`,
+        hint: "现在可以去点那个会弹窗的按钮了；弹出来后答案会记在弹窗账本里，你下一步读页面就能看到实际答了什么。",
+      };
+    }
+    if (op === "unarm") {
+      const ctl = dlgJson(DLG_CTL);
+      const had = !!ctl.arm;
+      delete ctl.arm;
+      dlgSetEach(DLG_CTL, ctl);
+      return { ok: true, msg: had ? "已撤掉预设答案" : "本来就没有预设答案" };
+    }
+    if (op === "clear") {
+      let n = 0;
+      const clearOne = (el) => {
+        try {
+          const st = JSON.parse((el.getAttribute("data-" + DLG_LOG) || "{}"));
+          n += Array.isArray(st.items) ? st.items.length : 0;
+          st.items = [];
+          st.seq = Number(st.seq) || 0; // 编号不清零：别让新事件复用旧编号
+          el.setAttribute("data-" + DLG_LOG, JSON.stringify(st));
+        } catch (_) {}
+      };
+      clearOne(document.documentElement || document);
+      try {
+        for (const f of document.querySelectorAll("iframe,frame")) {
+          let doc = null;
+          try {
+            doc = f.contentDocument;
+          } catch (_) {
+            continue;
+          }
+          if (doc && doc.documentElement) clearOne(doc.documentElement);
+        }
+      } catch (_) {}
+      return { ok: true, msg: `已清掉 ${n} 条弹窗记录（编号继续累加，不会复用）` };
+    }
+    if (op !== "list" && op !== "peek" && op !== "state") {
+      return { ok: false, msg: `dialog 不认识 op="${a.op}"`, hint: '可用：list（看账本）/ arm（预设答案）/ unarm / clear / state' };
+    }
+    const items = dlgList(true);
+    const head = "弹窗接管状态：" + dlgStateLine(st);
+    if (!items.length) return { ok: true, msg: head + "\n这页目前没有弹窗记录（没弹过，或已被 clear）", dialogs: [], dialogState: st };
+    return {
+      ok: true,
+      msg: head + `\n最近的浏览器弹窗（共 ${items.length} 条）：\n` + items.map(dlgLine).join("\n"),
+      dialogs: items,
+      dialogState: st,
+    };
+  }
+
   // 轻量探针：只报"页面现在长什么样"，**不碰编号表**
   // （自动化每轮用它判断有没有推进；不能调 snapshot()，那会 clear() 重编号）
   function probePage() {
+    beat("act"); // 自动化每轮都在读页面 —— 同样是"AI 正在干活"的证据，心跳要跟着续
     let text = "";
     try {
       text = norm(document.body ? document.body.innerText : "").slice(0, 4000);
@@ -2933,12 +3286,16 @@
       hasText: (q) => text.includes(q),
       scrollY: Math.round(window.scrollY),
       scrollHeight: document.body ? document.body.scrollHeight : 0,
+      // 自动化每轮都靠这两个字段知道"刚才有没有弹出浏览器对话框"（框不在 DOM 里，文字读不到）
+      dialogs: dlgList(8),
+      dialogState: dlgState(),
     };
   }
 
   // 判断某段文字在不在页面上（waitFor / guard / stopIf 用；不碰编号表）
   function hasText(q) {
     if (!q) return false;
+    beat("act");
     try {
       return norm(document.body ? document.body.innerText : "").includes(norm(q));
     } catch (_) {
@@ -2956,5 +3313,8 @@
     resolveLocator,
     probePage,
     hasText,
+    dialogAct,
+    dlgList,
+    dlgState,
   };
 })();

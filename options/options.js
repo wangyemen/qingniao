@@ -13,6 +13,9 @@ const defaultModelEl = document.getElementById("defaultModel");
 const contextEnabledEl = document.getElementById("contextEnabled");
 const contextWindowEl = document.getElementById("contextWindow");
 const autoCompressAtEl = document.getElementById("autoCompressAt");
+const dialogModeEl = document.getElementById("dialogMode");
+const dialogConfirmEl = document.getElementById("dialogConfirmAccept");
+const dialogPromptEl = document.getElementById("dialogPromptText");
 const saveBtn = document.getElementById("saveBtn");
 const saveStatusEl = document.getElementById("saveStatus");
 
@@ -40,6 +43,9 @@ function render() {
   contextEnabledEl.checked = settings.contextEnabled !== false;
   if (contextWindowEl) contextWindowEl.value = String(settings.contextWindow || 128000);
   if (autoCompressAtEl) autoCompressAtEl.value = String(Math.round((settings.autoCompressAt || 0.9) * 100));
+  if (dialogModeEl) dialogModeEl.value = ["ai", "auto", "off"].includes(settings.dialogMode) ? settings.dialogMode : "ai";
+  if (dialogConfirmEl) dialogConfirmEl.value = settings.dialogConfirmAccept === true ? "true" : "false";
+  if (dialogPromptEl) dialogPromptEl.value = typeof settings.dialogPromptText === "string" ? settings.dialogPromptText : "";
 }
 
 function providerCard(p, idx) {
@@ -501,6 +507,13 @@ async function save() {
       settings.autoCompressAt =
         Number.isFinite(p) && p >= 50 && p <= 98 ? Math.round(p) / 100 : 0.9;
     }
+    // 浏览器弹窗接管：保存后由 content/dialog-bridge.js 抄进页面里的 DOM 属性，
+    // 钩子在每次调用时现读 —— 所以**已打开的页面不用刷新也会跟着变**。
+    if (dialogModeEl) {
+      settings.dialogMode = ["ai", "auto", "off"].includes(dialogModeEl.value) ? dialogModeEl.value : "ai";
+    }
+    if (dialogConfirmEl) settings.dialogConfirmAccept = dialogConfirmEl.value === "true";
+    if (dialogPromptEl) settings.dialogPromptText = String(dialogPromptEl.value || "").slice(0, 200);
     for (const p of settings.providers) {
       for (const k of p.keys || []) {
         k.value = sanitizeKey(k.value);
