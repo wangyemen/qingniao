@@ -1,6 +1,6 @@
 青鸟 · 浏览器助手 —— 更新日志
 latest: 0.4.6
-released: 2026-11-11
+released: 2026-11-12
 repo: https://github.com/wangyemen/qingniao
 
 ## 0.4.6

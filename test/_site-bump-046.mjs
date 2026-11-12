@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 const VER = "0.4.6";
 const PREV = "0.4.5";
-const DATE = "2026-11-11"; // 与 version.txt 的 released 一致（侧栏更新弹窗显示的就是它）
+const DATE = "2026-11-12"; // 与 version.txt 的 released 一致（侧栏更新弹窗显示的就是它）
 const SIZE = "908 KB"; // dist/qingniao-0.4.6.zip = 930,038 字节
 const ZIP = (v) => `https://github.com/wangyemen/qingniao/releases/download/v${v}/qingniao-${v}.zip`;
 const MIRROR = (v) => `https://ghproxy.net/${ZIP(v)}`;
