@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>夹具 · 浏览器原生弹窗</title>
+  <style>
+    body { font-family: "Microsoft YaHei", sans-serif; padding: 24px; max-width: 760px; }
+    h1 { font-size: 18px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin: 12px 0; }
+    .hint { color: #666; font-size: 12px; }
+    button { margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <h1>浏览器原生弹窗（alert / confirm / prompt / 离开确认）</h1>
+  <p class="hint">
+    这几种框是浏览器画的、不在 DOM 里，而且会把整页 JS 按住。
+    这里每个按钮都<strong>在弹窗调用之后</strong>写一行结果 —— 只要那行字出来了，
+    就说明弹窗没有把页面卡住（青鸟接管生效）。
+  </p>
+
+  <div class="card">
+    <button id="btnAlert" aria-label="弹一个提示框">弹一个提示框 alert</button>
+    <div class="hint" id="altInfo">尚未调用</div>
+  </div>
+
+  <div class="card">
+    <button id="btnConfirm" aria-label="弹一个确认框">弹一个确认框 confirm</button>
+    <div class="hint" id="cfmInfo">尚未调用</div>
+  </div>
+
+  <div class="card">
+    <button id="btnPrompt" aria-label="弹一个输入框">弹一个输入框 prompt</button>
+    <div class="hint" id="prmInfo">尚未调用</div>
+  </div>
+
+  <div class="card">
+    <button id="btnUnload" aria-label="装上离开拦截">给这页装上「离开确认」</button>
+    <div class="hint" id="unlInfo">尚未安装</div>
+  </div>
+
+  <script>
+    var out = function (id, txt) {
+      document.getElementById(id).textContent = txt;
+    };
+    document.getElementById("btnAlert").addEventListener("click", function () {
+      // alert() 一旦不被接管，这行就永远写不进去（整页卡在框上）
+      window.alert("保存成功，共处理 3 条留言");
+      out("altInfo", "alert 已返回（页面没有被卡住）");
+    });
+    document.getElementById("btnConfirm").addEventListener("click", function () {
+      var ok = window.confirm("确定删除这条留言？");
+      out("cfmInfo", "confirm 返回：" + (ok ? "true（确定）" : "false（取消）"));
+    });
+    document.getElementById("btnPrompt").addEventListener("click", function () {
+      var v = window.prompt("请输入要保留的条数", "10");
+      out("prmInfo", "prompt 返回：" + (v === null ? "null（取消）" : '"' + v + '"'));
+    });
+    // 「离开站点？」：只在被要求时才装，测完立刻摘掉，别影响测试后面的步骤
+    document.getElementById("btnUnload").addEventListener("click", function () {
+      window.onbeforeunload = function (e) {
+        window.__fxUnloadCalls = (window.__fxUnloadCalls || 0) + 1;
+        e.preventDefault();
+        return "确定离开？";
+      };
+      // 在 AI 操控的这一瞬间自己测一次：接管应当"照常调用处理函数、但不许拦住离开"
+      window.__fxSelfTest = window.__fx.fireUnload();
+      out("unlInfo", "已安装 onbeforeunload；当场自检：" + JSON.stringify(window.__fxSelfTest));
+    });
+    // 供测试用：合成一次 beforeunload，看青鸟有没有把"拦住离开"的牙摘掉
+    window.__fx = {
+      fireUnload: function () {
+        var e = new Event("beforeunload", { cancelable: true });
+        window.dispatchEvent(e);
+        var prevented = false;
+        try {
+          prevented = e.defaultPrevented === true;
+        } catch (_) {}
+        var rv = "";
+        try {
+          rv = String(e.returnValue == null ? "" : e.returnValue);
+        } catch (_) {}
+        return {
+          calls: window.__fxUnloadCalls || 0,
+          prevented: prevented,
+          // returnValue 非空 = 浏览器会弹「离开站点？」
+          willBlock: prevented || rv !== "",
+        };
+      },
+      clearUnload: function () {
+        window.onbeforeunload = null;
+        return true;
+      },
+      log: function () {
+        var raw = document.documentElement.getAttribute("data-qn-dlg-log") || "";
+        try {
+          return JSON.parse(raw);
+        } catch (_) {
+          return { raw: raw };
+        }
+      },
+      cfg: function () {
+        return document.documentElement.getAttribute("data-qn-dlg-cfg") || "";
+      },
+    };
+  </script>
+</body>
+</html>

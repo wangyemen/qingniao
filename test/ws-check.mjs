@@ -30,7 +30,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------- 本地测试页 ----------
 const server = http.createServer((req, res) => {
   const name = path.basename(String(req.url || "").split("?")[0].split("#")[0]);
-  const allowed = new Set(["page1.html", "page2.html", "page9.html", "page10.html", "page11.html"]);
+  const allowed = new Set(["page1.html", "page2.html", "page9.html", "page10.html", "page11.html", "page13.html"]);
   if (!allowed.has(name)) {
     res.writeHead(404);
     res.end("nf");
@@ -1430,6 +1430,193 @@ await pageB.evaluate(() => {
 });
 await pageRt.close().catch(() => {});
 await sleep(2000); // 等 SW 清理：工作区里的页全关了 → 工作区消失
+
+// ---------- ㉓ 浏览器原生弹窗（alert / confirm / prompt / 离开确认）----------
+// 用户报的问题：alert 这种框是**浏览器画的、不在网页里**，侧栏既看不见它也点不到它，
+// 而且它一出现把整页 JS 按住 —— 表现就是"AI 点了个按钮之后侧栏卡死"。
+// 现在：页面世界里的钩子接管这四种框（记账 + 立刻同步一个答案），侧栏/AI 都能读能控。
+const pageDlg = await browser.newPage();
+await pageDlg.goto(`http://127.0.0.1:${PORT}/page13.html`, { waitUntil: "load" });
+await pageDlg.bringToFront();
+await sleep(700);
+
+const hookIn = await pageDlg.evaluate(() => ({
+  hasHook: !!window.__qnDialogHook,
+  api: !!(window.__qnDialog && window.__qnDialog.list),
+  // 页面自己探测 window.alert 时应当看起来还是原生的
+  disguised: String(window.alert).indexOf("[native code]") >= 0,
+  cfg: document.documentElement.getAttribute("data-qn-dlg-cfg") || "",
+}));
+check(
+  "弹窗接管钩子已装在页面里（document_start · MAIN world · 含伪装）",
+  hookIn.hasHook && hookIn.api && hookIn.disguised,
+  JSON.stringify(hookIn)
+);
+check("接管设置已由 bridge 抄进页面（改设置不用刷新）", /"mode"/.test(hookIn.cfg), hookIn.cfg);
+
+// 假 AI 的剧本：每步是一个**纯数据**指令（扩展页 CSP 禁 eval，别在这里塞代码字符串）。
+// 同时把"模型实际收到的【浏览器弹窗】段落"攒起来 —— 用来断言 AI 真的看得见这些框。
+await pageB.evaluate(() => {
+  window.__fxDlg = { queue: [], seenNote: "", acts: [] };
+  const act = (o) => {
+    window.__fxDlg.acts.push(o);
+    return [{ content: "好。\n```action\n" + JSON.stringify(o) + "\n```" }];
+  };
+  window.__responder = (req) => {
+    const msgs = (req && req.messages) || [];
+    const all = msgs.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    const last = msgs[msgs.length - 1];
+    const lastText = last && typeof last.content === "string" ? last.content : "";
+    const note = /【浏览器弹窗】[\s\S]*/.exec(lastText);
+    if (note) window.__fxDlg.seenNote += "\n@@\n" + note[0].slice(0, 900);
+    const nxt = window.__fxDlg.queue.shift();
+    if (!nxt) return [{ content: "这一步做完了。" }];
+    if (nxt.t === "armConfirm") return act({ action: "dialog", op: "arm", accept: true });
+    if (nxt.t === "armPrompt") return act({ action: "dialog", op: "arm", kind: "prompt", value: nxt.value });
+    // click：按 aria-label 从元素列表里取编号（和其它用例同一个套路）
+    const m = new RegExp("\\[(\\d+)\\][^\\n]*「" + nxt.label + "」").exec(all);
+    if (!m) return [{ content: "在元素列表里找不到「" + nxt.label + "」" }];
+    return act({ action: "click", target: Number(m[1]) });
+  };
+});
+const dlgSteps = (steps) => pageB.evaluate((s) => (window.__fxDlg.queue = s), steps);
+const dlgPage = () =>
+  pageDlg.evaluate(() => ({
+    alt: document.getElementById("altInfo").textContent,
+    cfm: document.getElementById("cfmInfo").textContent,
+    prm: document.getElementById("prmInfo").textContent,
+    log: (window.__qnDialog && window.__qnDialog.list()) || [],
+  }));
+
+// —— ① alert：点了之后页面立刻继续跑（没被框按住），而且 AI 看得见它 ——
+await dlgSteps([{ t: "click", label: "弹一个提示框" }]);
+await send("弹一个提示框", "好。");
+let d = await dlgPage();
+check(
+  "点 alert 按钮后页面没被卡住（alert 之后的代码照常执行）",
+  /已返回/.test(d.alt),
+  JSON.stringify(d.alt)
+);
+check(
+  "alert 的内容记进了弹窗账本（AI 读页面就能看见）",
+  d.log.some((it) => it.kind === "alert" && /保存成功，共处理 3 条留言/.test(it.msg || "")),
+  JSON.stringify(d.log.map((it) => it.kind + ":" + it.msg))
+);
+const note1 = await pageB.evaluate(() => window.__fxDlg.seenNote);
+check("【浏览器弹窗】段落确实发给了模型", /提示框 alert/.test(note1) && /保存成功/.test(note1), note1.slice(0, 220));
+
+// —— ② confirm：没人预设时默认答「取消」（绝不替用户点确定）——
+await dlgSteps([{ t: "click", label: "弹一个确认框" }]);
+await send("弹一个确认框", "好。");
+d = await dlgPage();
+check("confirm 无人预设时答「取消」（保守：不替用户点确定）", /false（取消）/.test(d.cfm), JSON.stringify(d.cfm));
+
+// —— ③ 侧栏/AI 的控制：先 arm「确定」再点 → 框真答了确定 ——
+await dlgSteps([{ t: "armConfirm" }, { t: "click", label: "弹一个确认框" }]);
+await send("先预设确定再去弹确认框", "好。");
+d = await dlgPage();
+const cfmRec = d.log.filter((x) => x.kind === "confirm").pop() || {};
+check(
+  "AI 可以「先预设答案、再去点」：confirm 按预设答了「确定」",
+  /true（确定）/.test(d.cfm),
+  JSON.stringify({ cfm: d.cfm, 账本: cfmRec.answer + " / " + cfmRec.by })
+);
+// —— ④ prompt：预设一段文字 → 页面真收到那段文字 ——
+await dlgSteps([{ t: "armPrompt", value: "7 条" }, { t: "click", label: "弹一个输入框" }]);
+await send("预设好答案再去弹输入框", "好。");
+d = await dlgPage();
+check("prompt 按 AI 预设填了字（页面收到「7 条」）", /7 条/.test(d.prm), JSON.stringify(d.prm));
+
+// —— ⑤「离开站点？」：接管时放行；关掉接管必须恢复浏览器原生拦截 ——
+await dlgSteps([{ t: "click", label: "装上离开拦截" }]);
+await send("给这页装上离开拦截", "好。");
+const byAi = await pageDlg.evaluate(() => ({
+  self: window.__fxSelfTest || null, // 页面在 AI 点击的当场自己测的那一次
+  records: (window.__qnDialog.list() || []).filter((it) => it.kind === "beforeunload"),
+}));
+check(
+  "AI 操控期间的「离开确认」被放行（页面的处理函数照常跑，但不许拦住离开）",
+  !!byAi.self && byAi.self.calls > 0 && byAi.self.willBlock === false,
+  JSON.stringify(byAi.self)
+);
+check(
+  "被放行的「离开确认」也记了账（AI 知道页面本来想拦）",
+  byAi.records.length > 0,
+  JSON.stringify(byAi.records.map((r) => r.msg + " → " + r.answer))
+);
+const byGrace = await pageDlg.evaluate(() => window.__fx.fireUnload());
+check(
+  "本轮结束后还有 20 秒收尾窗口（「点完一秒后才弹出的框」算这一步的尾巴）",
+  byGrace.willBlock === false,
+  JSON.stringify(byGrace)
+);
+
+// 心跳**只延长、不剪短**：自动执行下一轮模型可能思考超过 90 秒（深度思考 / 5 次重试 / 换模型 / 压缩记忆），
+// 这期间没有谁能替你点弹窗 —— 心跳断了整页就会被一个 alert 按住，这一轮再也回不来。
+const mono = await (async () => {
+  const tid = await pageB.evaluate(
+    (port) => chrome.tabs.query({ url: `http://127.0.0.1:${port}/page13.html` }).then((t) => t[0] && t[0].id),
+    PORT
+  );
+  const read = () =>
+    pageDlg.evaluate(() => JSON.parse(document.documentElement.getAttribute("data-qn-dlg-live") || "{}"));
+  const ping = (ttl) =>
+    pageB.evaluate(
+      (id, ms) => chrome.tabs.sendMessage(id, { type: "dialog:beat", ttl: ms }).catch(() => {}),
+      tid,
+      ttl
+    );
+  const left = (o) => (Number(o.ai) === 1 ? Number(o.at) + Number(o.ttl) - Date.now() : 0);
+  await ping(300000);
+  const a = left(await read());
+  await ping(15000); // 更短的一声音：不许把上面那个长窗口剪掉
+  const b = left(await read());
+  return { 长声音后: a, 短声音后: b };
+})();
+check(
+  "心跳只延长、不剪短（模型思考再久也不会漏出接管空窗）",
+  mono.短声音后 >= 280000 && mono.长声音后 <= 305000,
+  JSON.stringify(mono)
+);
+
+await pageB.evaluate(async () => {
+  const got = await chrome.storage.local.get("ai_browser_settings");
+  const s = got.ai_browser_settings;
+  s.dialogMode = "off";
+  await chrome.storage.local.set({ ai_browser_settings: s });
+});
+await sleep(500);
+const byNative = await pageDlg.evaluate(() => window.__fx.fireUnload());
+check(
+  "设置改成「不接管」后立刻恢复浏览器原生拦截（不用刷新页面）",
+  byNative.willBlock === true,
+  JSON.stringify(byNative)
+);
+await pageDlg.evaluate(() => window.__fx.clearUnload());
+await pageB.evaluate(async () => {
+  const got = await chrome.storage.local.get("ai_browser_settings");
+  const s = got.ai_browser_settings;
+  s.dialogMode = "ai";
+  await chrome.storage.local.set({ ai_browser_settings: s });
+});
+
+const dlgTabId = await pageB.evaluate(
+  (port) => chrome.tabs.query({ url: `http://127.0.0.1:${port}/page13.html` }).then((t) => t[0] && t[0].id),
+  PORT
+);
+const dlgSession = await wsSessionText(dlgTabId);
+check(
+  "弹窗在会话里留了痕（记忆压缩之后 AI 也还知道刚才弹过什么）",
+  /【浏览器弹窗】/.test(dlgSession),
+  JSON.stringify({ hasNote: /【浏览器弹窗】/.test(dlgSession), 片段: (dlgSession.match(/【浏览器弹窗】[^\n]*/) || [])[0] })
+);
+
+await pageB.evaluate(() => {
+  window.__responder = null;
+  window.__fxDlg = null;
+});
+await pageDlg.close().catch(() => {});
+await sleep(2000); // 等 SW 清理掉这份工作区，别影响后面的断言
 
 // ---------- ⑤ 关标签页 → 工作区消失 + 会话删除 ----------
 // 注意：先按"工作区 id"过滤，跟历史里堆积的会话无关
