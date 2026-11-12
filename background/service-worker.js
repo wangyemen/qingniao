@@ -267,6 +267,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // 页面里的弹窗接管钩子记了一笔（alert / confirm / prompt / 离开确认）→ 转告侧栏。
+  // 侧栏不在也没关系：这本账就记在页面上（data-qn-dlg-log），AI 下次读页面照样拿得到。
+  if (msg.type === "dialog:event") {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    const frameId = sender && sender.frameId != null ? sender.frameId : 0;
+    (async () => {
+      let title = "";
+      let url = "";
+      try {
+        const t = await chrome.tabs.get(tabId);
+        title = (t && t.title) || "";
+        url = (t && t.url) || "";
+      } catch (_) {}
+      try {
+        const p = chrome.runtime.sendMessage({
+          type: "dialog:event",
+          tabId,
+          frameId,
+          title,
+          url,
+          ev: msg.ev,
+        });
+        if (p && p.catch) p.catch(() => {}); // 没有面板在线，忽略
+      } catch (_) {}
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+
   // 侧栏问：某个标签页属于哪个工作区（隔离校验用）
   if (msg.type === "ws:of") {
     (async () => {

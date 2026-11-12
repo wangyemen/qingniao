@@ -169,6 +169,31 @@ document.addEventListener("click", (ev) => {
 
 // ===== 标签页基础工具 =====
 
+// 注入调用的超时兜底。
+// 为什么必须有：页面被**浏览器原生弹窗**（alert/confirm/prompt/文件选择/打印/离开确认）按住时，
+// 整页 JS 是停着的，chrome.scripting 的调用会一直不回来 —— 以前侧栏就这么干挂着，
+// 用户看到的就是"我点了个按钮，侧栏死了"。到点先撒手，把话说清楚（接管开关见设置页）。
+function withTimeout(promise, ms, what) {
+  let timer = null;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error("页面在 " + Math.round(ms / 1000) + " 秒内没有回应（" + what + "）");
+      e.qnTimeout = true;
+      reject(e);
+    }, ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+function timeoutNote(err) {
+  return (
+    "页面没响应：" +
+    ((err && err.message) || err) +
+    "。最常见的原因是页面上有一个**浏览器自己的弹窗**（alert / confirm / 文件选择框 / 打印框）" +
+    "把整页 JS 按住了：这种框不在网页里，青鸟只能替 AI 操控中的页面接管 alert/confirm/prompt/离开确认。"
+  );
+}
+
 export async function describeTab(tabId) {
   try {
     const t = await chrome.tabs.get(tabId);
@@ -180,10 +205,11 @@ export async function describeTab(tabId) {
 
 async function pageUrlOf(tabId) {
   try {
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => location.href,
-    });
+    const [{ result }] = await withTimeout(
+      chrome.scripting.executeScript({ target: { tabId }, func: () => location.href }),
+      4000,
+      "读网址"
+    );
     return typeof result === "string" ? result : null;
   } catch (_) {
     return null;
@@ -219,8 +245,22 @@ async function preflightTarget(tabId, expectUrl) {
   return { ok: true, tab };
 }
 
-async function injectScript(tabId, file) {
-  await chrome.scripting.executeScript({ target: { tabId }, files: [file] });
+// 给这一页的**所有框架**递一声"AI 在 / 不在干活"。
+// 为什么不能只靠 control.js 自己写心跳：它只注入得到顶层框架，而**跨域 iframe 里的 alert
+// 一样会把整页按住**（整页 = 包括顶层框架）。那些进不去的框架由 dialog-bridge.js 代收这一声。
+function pingDialogFrames(tabId, on, ttl) {
+  if (tabId == null) return;
+  try {
+    const p = chrome.tabs.sendMessage(tabId, {
+      type: on ? "dialog:beat" : "dialog:idle",
+      ttl: Number(ttl) || 90000,
+    });
+    if (p && p.catch) p.catch(() => {}); // 这一页没有我们的桥（浏览器内置页等）：忽略
+  } catch (_) {}
+}
+
+async function injectScript(tabId, file) {  // 注入本身也要超时：页面被原生弹窗按住时，executeScript 的 Promise 可能永远不回来
+  await withTimeout(chrome.scripting.executeScript({ target: { tabId }, files: [file] }), 6000, "注入脚本");
 }
 
 async function waitTabSettle(tabId, maxMs = 6000) {
@@ -258,20 +298,28 @@ async function getPageSnapshot(tabId) {
     return { restricted: true, url: t.url || "", title: t.title || "", elements: [] };
   }
   const delays = [0, 400, 800, 1200, 1600];
+  pingDialogFrames(tabId, true); // 读页面 = AI 在这页干活 → 各框架的接管心跳跟着续一下
+  let stuck = null;
   for (const delay of delays) {
     if (delay) await sleepMs(delay);
     try {
       await injectScript(tabId, "content/control.js");
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (max) => globalThis.__aiCtl.snapshot(max),
-        args: [60],
-      });
+      const [{ result }] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          func: (max) => globalThis.__aiCtl.snapshot(max),
+          args: [60],
+        }),
+        9000,
+        "读页面元素"
+      );
       if (result) {
         result.empty = !(result.elements && result.elements.length);
         return result;
       }
-    } catch (_) {}
+    } catch (err) {
+      if (err && err.qnTimeout) stuck = err;
+    }
   }
   let url = "";
   let title = "";
@@ -281,18 +329,32 @@ async function getPageSnapshot(tabId) {
     title = cur?.title || "";
   } catch (_) {}
   const unreachable = /^https?:/.test(url);
-  return { failed: true, empty: true, unreachable, url, title, elements: [] };
+  return {
+    failed: true,
+    empty: true,
+    unreachable,
+    url,
+    title,
+    elements: [],
+    // 页面完全读不进来 + 是超时造成的 → 八成是原生弹窗把整页按住了，如实报上去
+    stuck: stuck ? timeoutNote(stuck) : "",
+  };
 }
 
 async function setBanner(tabId, show) {
   if (tabId == null) return;
+  pingDialogFrames(tabId, !!show);
   try {
     await injectScript(tabId, "content/control.js");
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (s) => globalThis.__aiCtl.banner(s),
-      args: [show],
-    });
+    await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        func: (s) => globalThis.__aiCtl.banner(s),
+        args: [show],
+      }),
+      6000,
+      "更新提示条"
+    );
   } catch (_) {}
 }
 
@@ -368,6 +430,11 @@ export class WorkspaceRuntime {
     this.compressedThisTurn = false;
     // 自动化任务：用户点取消时置 true，循环每轮检查它（这样"取消"才真的能停）
     this.automationCancel = false;
+    // 浏览器原生弹窗（alert / confirm / prompt / 离开确认）：
+    // dialogSeen 保证"同一条只讲一次"（账本每次读页面都会整本带回来，不去重会刷屏）；
+    // pendingDialogs 收页面实时推来的事件（跨域 iframe 里的账本读不到，只能靠它）。
+    this.dialogSeen = new Set();
+    this.pendingDialogs = [];
     // AI 自己用 newtab 开过的标签页（只有这些才允许 closetab 关）
     // AI 自己开的页记在 ws.aiTabs 里（落盘，跨侧栏实例也认）
     if (!Array.isArray(this.ws.aiTabs)) this.ws.aiTabs = [];
@@ -924,25 +991,147 @@ export class WorkspaceRuntime {
     };
   }
 
+  // ===== 浏览器原生弹窗（alert / confirm / prompt / 「离开站点？」）=====
+  //
+  // 这几种框是浏览器画的、不在网页里：读元素 / a11y / extract 永远看不见它，
+  // 而且它一出现会把整页 JS 按住（以前就是"点了个按钮，侧栏卡死"）。
+  // 现在 content/dialog-hook.js 在 AI 操控页面期间把它们接管掉，并把
+  // "弹了什么、被答成什么"记在页面 DOM 属性那本账上，随 snapshot / probe 一起带回来。
+  // 这边负责：去重 → 讲给 AI（写进会话，之后压缩记忆也还在）→ 提示条给用户看。
+  _dialogKey(it) {
+    return (it && it.at ? it.at : 0) + "|" + (it && it.seq ? it.seq : 0) + "|" + ((it && it.frame) || "");
+  }
+
+  _newDialogs(list) {
+    const out = [];
+    for (const it of list || []) {
+      if (!it || !it.kind) continue;
+      const k = this._dialogKey(it);
+      if (this.dialogSeen.has(k)) continue;
+      this.dialogSeen.add(k);
+      out.push(it);
+    }
+    // 兜个上限：长跑任务别把这页的账记到无穷大
+    while (this.dialogSeen.size > 400) this.dialogSeen.delete(this.dialogSeen.values().next().value);
+    return out;
+  }
+
+  dialogLines(list) {
+    const CN = {
+      alert: "提示框 alert",
+      confirm: "确认框 confirm",
+      prompt: "输入框 prompt",
+      beforeunload: "离开页面确认",
+    };
+    return (list || []).map((it) => {
+      const t = new Date(Number(it.at) || Date.now());
+      const p = (n) => String(n).padStart(2, "0");
+      const hh = p(t.getHours()) + ":" + p(t.getMinutes()) + ":" + p(t.getSeconds());
+      return (
+        `${CN[it.kind] || it.kind}「${clip(it.msg || "（空内容）", 90)}」→ ${it.answer || "已处理"}` +
+        (it.by ? `（${it.by}）` : "") +
+        (it.frame ? ` · ${it.frame}` : "") +
+        ` @ ${hh}`
+      );
+    });
+  }
+
+  // 把"新出现的弹窗"整理成一段可以直接塞进会话的文字（没有就返回空串）
+  collectDialogs(snapshot) {
+    const fromPage = snapshot && Array.isArray(snapshot.dialogs) ? snapshot.dialogs : [];
+    const fresh = this._newDialogs([...fromPage, ...this.pendingDialogs]);
+    this.pendingDialogs = [];
+    if (!fresh.length) return "";
+    const st = snapshot && snapshot.dialogState;
+    const head =
+      "【浏览器弹窗】下面这些框是浏览器画的、不在页面 DOM 里（元素列表读不到它们）。" +
+      "青鸟在 AI 操控本页期间已替你处理，页面没有卡住：";
+    let tail;
+    if (st && !st.hooked) {
+      tail =
+        "\n（注意：这一页其实**没装上**接管钩子 —— 扩展安装/更新之前就打开的页面不会有。" +
+        "真遇到原生框就得用户手动点，或让用户刷新该页。）";
+    } else if (st && st.mode === "off") {
+      tail = "\n（当前设置是「不接管浏览器弹窗」：上面是历史/其它来源的记录，真弹框时页面会等用户点。）";
+    } else {
+      tail =
+        '\n（要改下一个框的答案：**先预设再点** —— {"action":"dialog","op":"arm","accept":true} ' +
+        '（confirm 答"确定"）或 {"action":"dialog","op":"arm","value":"要填的文字"}（prompt）；' +
+        '看整本账用 {"action":"dialog"}。）';
+    }
+    return head + "\n" + this.dialogLines(fresh).map((l) => "· " + l).join("\n") + tail;
+  }
+
+  // 把"新出现的弹窗 + 页面卡住的迹象"落成一条会话消息。
+  // 用在两个时机：① 一轮刚开始（AI 闲着的时候可能已经弹过框了）；② 动作结果之后（见主循环）。
+  async noteDialogs(snapshot) {
+    const parts = [];
+    const note = this.collectDialogs(snapshot);
+    if (note) parts.push(note);
+    if (snapshot && snapshot.stuck) parts.push("【页面没响应】" + snapshot.stuck);
+    if (!parts.length) return false;
+    try {
+      this.session.messages.push({ role: "user", content: parts.join("\n"), isDialogNote: true });
+      await this.ctx.saveSession(this.session);
+    } catch (_) {}
+    return true;
+  }
+
+  // 页面实时推来的事件（dialog-bridge → service worker → 面板）
+  // AI 正在忙 → 先攒着，下一步动作结果里一起讲；AI 闲着 → 立刻提示条给用户看。
+  // opts.store === false 表示"这份工作区现在不是我这份面板显示的"（同一条广播会送到
+  // 每份面板文档）：那种情况只提示、不写会话，否则一条弹窗会在对话里留下好几份。
+  onDialogEvent(ev, opts = {}) {
+    if (!ev || !ev.kind) return;
+    if (this.dialogSeen.has(this._dialogKey(ev))) return;
+    this.pendingDialogs.push(ev);
+    while (this.pendingDialogs.length > 20) this.pendingDialogs.shift();
+    try {
+      this.addNoteBubble("🔔 页面弹出「" + clip(ev.msg || "（空内容）", 60) + "」→ " + (ev.answer || "已处理"));
+    } catch (_) {}
+    if (this.busy || opts.store === false) return;
+    const note = this.collectDialogs(null);
+    if (!note) return;
+    try {
+      this.session.messages.push({ role: "user", content: note, isDialogNote: true });
+      Promise.resolve(this.ctx.saveSession(this.session)).catch(() => {});
+    } catch (_) {}
+  }
+
   // 文本模板：把 {page} 这类占位换成变量值
   _tpl(text, vars) {
     return String(text == null ? "" : text).replace(/\{(\w+)\}/g, (m, k) => (vars[k] === undefined ? m : String(vars[k])));
   }
 
-  // 页面探针（不碰编号表）：拿当前文字/页码/滚动状态
+  // 页面探针（不碰编号表）：拿当前文字/页码/滚动状态 + 弹窗账本
+  // 超时后返回 { stuck:true }：调用方（自动化主循环）据此尽早停下汇报，而不是空转到 maxMs
   async _probe(tabId) {
     try {
       await injectScript(tabId, "content/control.js");
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const p = globalThis.__aiCtl.probePage();
-          return { url: p.url, title: p.title, textLen: p.textLen, marks: p.marks, scrollY: p.scrollY, scrollHeight: p.scrollHeight, sample: p.sample };
-        },
-      });
+      const [{ result }] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => {
+            const p = globalThis.__aiCtl.probePage();
+            return {
+              url: p.url,
+              title: p.title,
+              textLen: p.textLen,
+              marks: p.marks,
+              scrollY: p.scrollY,
+              scrollHeight: p.scrollHeight,
+              sample: p.sample,
+              dialogs: p.dialogs,
+              dialogState: p.dialogState,
+            };
+          },
+        }),
+        8000,
+        "页面探针"
+      );
       return result || null;
-    } catch (_) {
-      return null;
+    } catch (err) {
+      return { stuck: err && err.qnTimeout ? timeoutNote(err) : "", url: "", marks: "", textLen: -1, scrollY: -1, dialogs: [] };
     }
   }
 
@@ -951,11 +1140,15 @@ export class WorkspaceRuntime {
     if (!text) return false;
     try {
       await injectScript(tabId, "content/control.js");
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (q) => globalThis.__aiCtl.hasText(q),
-        args: [String(text)],
-      });
+      const [{ result }] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          func: (q) => globalThis.__aiCtl.hasText(q),
+          args: [String(text)],
+        }),
+        8000,
+        "查文字"
+      );
       return !!result;
     } catch (_) {
       return false;
@@ -968,22 +1161,26 @@ export class WorkspaceRuntime {
     const text = step.text || step.label || "";
     try {
       await injectScript(tabId, "content/control.js");
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (idx, txt) => {
-          const ctl = globalThis.__aiCtl;
-          if (idx != null && Number.isFinite(idx)) {
-            const loc = ctl.makeLocator(idx);
-            if (loc) {
-              if (txt && !loc.text) loc.text = String(txt);
-              return loc;
+      const [{ result }] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          func: (idx, txt) => {
+            const ctl = globalThis.__aiCtl;
+            if (idx != null && Number.isFinite(idx)) {
+              const loc = ctl.makeLocator(idx);
+              if (loc) {
+                if (txt && !loc.text) loc.text = String(txt);
+                return loc;
+              }
             }
-          }
-          // 没有编号（或编号已失效）→ 只用文字当定位器
-          return txt ? { index: null, text: String(txt), role: "", aria: "", id: "", name: "", path: "", near: [], rect: null } : null;
-        },
-        args: [want, text],
-      });
+            // 没有编号（或编号已失效）→ 只用文字当定位器
+            return txt ? { index: null, text: String(txt), role: "", aria: "", id: "", name: "", path: "", near: [], rect: null } : null;
+          },
+          args: [want, text],
+        }),
+        8000,
+        "做定位器"
+      );
       return result || null;
     } catch (_) {
       return null;
@@ -1081,19 +1278,29 @@ export class WorkspaceRuntime {
               opts.locators.set(rawStep, locator);
             }
             if (locator) {
-              const [{ result: st }] = await chrome.scripting.executeScript({
-                target: { tabId },
-                func: (loc) => {
-                  const r = globalThis.__aiCtl.resolveLocator(loc);
-                  if (!r.ok) return { found: false, disabled: false };
-                  let disabled = false;
-                  try {
-                    disabled = !!(r.el.disabled || r.el.getAttribute("aria-disabled") === "true");
-                  } catch (_) {}
-                  return { found: true, disabled };
-                },
-                args: [locator],
-              });
+              let st = null;
+              try {
+                [{ result: st }] = await withTimeout(
+                  chrome.scripting.executeScript({
+                    target: { tabId },
+                    func: (loc) => {
+                      const r = globalThis.__aiCtl.resolveLocator(loc);
+                      if (!r.ok) return { found: false, disabled: false };
+                      let disabled = false;
+                      try {
+                        disabled = !!(r.el.disabled || r.el.getAttribute("aria-disabled") === "true");
+                      } catch (_) {}
+                      return { found: true, disabled };
+                    },
+                    args: [locator],
+                  }),
+                  8000,
+                  "等就绪"
+                );
+              } catch (_) {
+                // 页面没回应（可能被原生框按住）：这一轮当作"没等到"，别把循环挂死在这
+                st = null;
+              }
               const found = !!(st && st.found);
               const disabled = !!(st && st.disabled);
               if (
@@ -1158,16 +1365,26 @@ export class WorkspaceRuntime {
       let result = null;
       for (let attempt = 0; attempt <= retry.times; attempt++) {
         try {
-          const [{ result: r }] = await chrome.scripting.executeScript({
-            target: { tabId },
-            func: (a) => globalThis.__aiCtl.act(a),
-            args: [mapped],
-          });
+          const [{ result: r }] = await withTimeout(
+            chrome.scripting.executeScript({
+              target: { tabId },
+              func: (a) => globalThis.__aiCtl.act(a),
+              args: [mapped],
+            }),
+            30000,
+            "执行步骤"
+          );
           result = r && typeof r === "object" ? r : null;
         } catch (err) {
-          result = { ok: false, msg: "页面没响应：" + ((err && err.message) || err) };
+          result = {
+            ok: false,
+            msg: err && err.qnTimeout ? timeoutNote(err) : "页面没响应：" + ((err && err.message) || err),
+            stuck: !!(err && err.qnTimeout),
+          };
         }
         if (result && result.ok) break;
+        // 卡住（多半是原生框按住整页）重试也没用，直接停
+        if (result && result.stuck) break;
         if (attempt < retry.times) {
           log.push(`✗ ${result ? result.msg : "步骤失败"} → ${retry.intervalMs}ms 后重试`);
           await sleepMs(retry.intervalMs);
@@ -1209,23 +1426,31 @@ export class WorkspaceRuntime {
         locators.set(until, locator);
       }
       if (!locator) return false;
-      const [{ result: res }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (loc) => {
-          const r = globalThis.__aiCtl.resolveLocator(loc);
-          if (!r.ok) return { found: false };
-          let disabled = false;
-          try {
-            disabled = !!(r.el.disabled || r.el.getAttribute("aria-disabled") === "true");
-          } catch (_) {}
-          return { found: true, disabled, how: r.how };
-        },
-        args: [locator],
-      });
-      const found = !!(res && res.found);
-      if (op === "present") return found;
-      if (op === "disabled") return !found || !!res.disabled; // 变灰/找不到都算"到头了"
-      return !found;
+      try {
+        const [{ result: res }] = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId },
+            func: (loc) => {
+              const r = globalThis.__aiCtl.resolveLocator(loc);
+              if (!r.ok) return { found: false };
+              let disabled = false;
+              try {
+                disabled = !!(r.el.disabled || r.el.getAttribute("aria-disabled") === "true");
+              } catch (_) {}
+              return { found: true, disabled, how: r.how };
+            },
+            args: [locator],
+          }),
+          8000,
+          "判停止条件"
+        );
+        const found = !!(res && res.found);
+        if (op === "present") return found;
+        if (op === "disabled") return !found || !!res.disabled; // 变灰/找不到都算"到头了"
+        return !found;
+      } catch (_) {
+        return false;
+      }
     }
     return false;
   }
@@ -1251,6 +1476,8 @@ export class WorkspaceRuntime {
         break;
       }
       rounds = i;
+      // 循环期间这一页（含跨域框架）的弹窗接管保持有效；每轮续一声，比每个探针都续省得多
+      pingDialogFrames(tabId, true, Math.min(600000, maxMs));
       this.activeDeferTask = {
         ...(this.activeDeferTask || {}),
         id: cfg.taskId,
@@ -1299,6 +1526,16 @@ export class WorkspaceRuntime {
 
       // 轻量验证：页面有没有真的推进（不拍快照，避免重编号）
       const now = await this._probe(tabId);
+      // 浏览器原生弹窗：它不在 DOM 里，"页面文字"永远读不到，只能从页面里的账本拿。
+      // 不记下来的话，AI 事后看到的只是"点了没反应"，根本不知道有个框被答掉了。
+      for (const line of this.dialogLines(this._newDialogs(now && now.dialogs))) {
+        log.push(`#${i} ⚠ ${line}`);
+      }
+      if (now && now.stuck) {
+        stoppedBy = "stuck";
+        log.push(`#${i} ✗ ${now.stuck}`);
+        break;
+      }
       const progressed =
         !prev || !now
           ? true
@@ -1359,7 +1596,9 @@ export class WorkspaceRuntime {
           `变量现状：${JSON.stringify(result.vars || {})}\n` +
           (detail ? `执行记录：\n${detail}\n` : "") +
           `\n（这是程序跑完的结果。请**先读取页面确认现状**，再执行剩下的任务；` +
-          `如果停止原因是 locatorFailed/stalled/stopIf，说明页面结构和预期不一样，先判断原因再决定怎么做。）`,
+          `如果停止原因是 locatorFailed/stalled/stopIf，说明页面结构和预期不一样，先判断原因再决定怎么做；` +
+          `如果是 stuck，说明页面被什么东西按住了（多半是浏览器自己的弹窗/文件框）——` +
+          `按上面弹窗记录用 {"action":"dialog","op":"arm",...} 预设答案后重试，或让用户点一下。）`,
         isActionResult: true,
       });
       await this.ctx.saveSession(this.session);
@@ -1396,10 +1635,14 @@ export class WorkspaceRuntime {
     if (!tab || !tab.url || !/^https?:/.test(tab.url)) return null;
     try {
       await injectScript(tab.id, "content/extract.js");
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => globalThis.__aiBrowseExtract(6000),
-      });
+      const [{ result }] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => globalThis.__aiBrowseExtract(6000),
+        }),
+        8000,
+        "读正文"
+      );
       return result || null;
     } catch (_) {
       return null;
@@ -1654,11 +1897,15 @@ export class WorkspaceRuntime {
       let armed = { ok: true, msg: "" };
       try {
         await injectScript(tabId, "content/control.js");
-        const [{ result: r }] = await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (id, a) => globalThis.__aiCtl.armDefer(id, a),
-          args: [taskId, { ...action, taskId }],
-        });
+        const [{ result: r }] = await withTimeout(
+          chrome.scripting.executeScript({
+            target: { tabId },
+            func: (id, a) => globalThis.__aiCtl.armDefer(id, a),
+            args: [taskId, { ...action, taskId }],
+          }),
+          8000,
+          "挂后台任务"
+        );
         armed = r && typeof r === "object" ? r : { ok: false, msg: "页面未响应" };
       } catch (err) {
         return { ok: false, msg: "无法在该页面挂载等待监听：" + (err.message || err) };
@@ -1688,6 +1935,9 @@ export class WorkspaceRuntime {
       } catch (err) {
         return { ok: false, msg: "后台任务注册失败：" + (err.message || err) };
       }
+      // 等条件的这段时间，这一页（含跨域框架）里的弹窗仍归青鸟接管 ——
+      // 否则"等页面弹出某个框"这种后台任务永远等不到（框被还给用户了）。
+      pingDialogFrames(tabId, true, Math.min(600000, timeoutSec * 1000));
       const untilDesc =
         until.type === "video-ended"
           ? "视频播放结束"
@@ -1735,15 +1985,32 @@ export class WorkspaceRuntime {
     let result;
     try {
       await injectScript(tabId, "content/control.js");
-      const [{ result: r }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (a) => globalThis.__aiCtl.act(a),
-        args: [action],
-        // 注：注入函数返回 Promise 时浏览器会自动等待（新版已不允许传 awaitPromise 参数）
-      });
+      const [{ result: r }] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          func: (a) => globalThis.__aiCtl.act(a),
+          args: [action],
+          // 注：注入函数返回 Promise 时浏览器会自动等待（新版已不允许传 awaitPromise 参数）
+        }),
+        30000,
+        "执行动作"
+      );
       result = r && typeof r === "object" ? r : { ok: false, msg: "页面未响应动作" };
     } catch (err) {
-      result = { ok: true, msg: "页面已跳转或重载，动作可能已生效：" + (err.message || err) };
+      if (err && err.qnTimeout) {
+        // 卡住 ≠ 失败：动作可能已经生效，只是页面回不来了。措辞要稳住模型别重试。
+        result = {
+          ok: false,
+          msg: timeoutNote(err),
+          hint:
+            "先别重复这个动作（它很可能已经生效）。用 {\"action\":\"dialog\"} 看这页的弹窗账本；" +
+            "确实卡在浏览器弹窗上（文件选择框、打印框这类接管不到的），就告诉用户手动点一下，" +
+            "或在设置页把「浏览器弹窗接管」调成「始终接管」。",
+          stuck: true,
+        };
+      } else {
+        result = { ok: true, msg: "页面已跳转或重载，动作可能已生效：" + ((err && err.message) || err) };
+      }
     }
 
     const settled = await waitTabSettle(tabId, 6000);
@@ -1917,10 +2184,14 @@ export class WorkspaceRuntime {
     const ctlOn = this.ctx.toggleState().ctl;
     const controlOn = ctlOn && tabId != null;
     let snapshot = null;
+    let beatTimer = null; // 本轮的弹窗接管心跳（见下方 setInterval）
     if (controlOn) {
       this.setStatus("正在分析页面元素…", "busy");
       snapshot = await getPageSnapshot(tabId);
     }
+    // AI 上一轮结束到现在的这段时间里，这页可能弹过浏览器框（它不在 DOM 里，
+    // 不主动补这一句，AI 永远不知道自己"点了个会弹框的按钮"）
+    if (controlOn) await this.noteDialogs(snapshot);
     this.targetPageLabel = (snapshot?.title || targetTab?.title || "").slice(0, 42);
     let lastSentSig = elementsSig(snapshot);
 
@@ -2082,6 +2353,13 @@ export class WorkspaceRuntime {
       let stuckKey = null;
       let stuckCount = 0;
       let formatErrCount = 0;
+
+      // **心跳保活**：页面里的"AI 正在操控"接管心跳只有 90 秒，而这一轮里模型可能想很久
+      //（深度思考、失败重试各等 5~9 秒、换下一批模型再重试、中途压缩记忆…）。
+      // 自动执行下这段时间没有谁能替你点浏览器弹窗 —— 心跳一断，页面弹出的 alert 就把整页按住，
+      // 这一轮再也回不来。所以整个这一轮每 30 秒给这一页（含跨域框架）续一次。
+      beatTimer = setInterval(() => pingDialogFrames(tabId, true, 60000), 30000);
+      pingDialogFrames(tabId, true, 90000);
 
       for (let step = 0; ; step++) {
         const ui = this.createAssistantBubble();
@@ -2577,6 +2855,11 @@ export class WorkspaceRuntime {
             } catch (_) {}
           }
         }
+        // 这一步期间弹过的浏览器框（弹了什么、被答成了什么）一并讲清楚 ——
+        // 否则 AI 只看到"点了没反应"，接下来就去干"再点一次"这种危险事了。
+        const dlgNote = this.collectDialogs(snapshot);
+        if (dlgNote) resultMsg += "\n" + dlgNote;
+        if (snapshot && snapshot.stuck) resultMsg += "\n【页面没响应】" + snapshot.stuck;
         this.session.messages.push({ role: "user", content: resultMsg, isActionResult: true });
         await this.ctx.saveSession(this.session);
 
@@ -2604,6 +2887,9 @@ export class WorkspaceRuntime {
       this.addErrorBubble("出错了：" + (err.message || err));
       this.setStatus("请求失败", "err");
     } finally {
+      // 本轮结束：停掉心跳保活。页面里的接管窗口由下面 setBanner(false) → control.js 收成 20 秒收尾，
+      // 或者（还挂着后台任务时）保持到任务结束。
+      if (beatTimer) clearInterval(beatTimer);
       this.busy = false;
       this.abortController = null;
       this.pendingConfirm = null;

@@ -475,6 +475,15 @@ async function init() {
       return;
     }
 
+    // 页面弹了浏览器原生对话框（alert/confirm/prompt/离开确认）并且已被青鸟接管处理掉。
+    // 交给"管着那一页"的工作区：提示条立刻给用户看；这一份面板正在显示它时，
+    // 才把它写进会话（多份面板文档都收到广播，都写就会留下重复记录）。
+    if (msg.type === "dialog:event" && msg.ev) {
+      const rt = runtimeOfTab(msg.tabId);
+      if (rt) rt.onDialogEvent(msg.ev, { store: rt.ws.id === activeWsId });
+      return;
+    }
+
     // 另一份面板开始/结束运行这块工作区 → 更新自己的按钮状态
     if (msg.type === "ws:busy" && msg.wsId) {
       applyRemoteBusy(msg.wsId, msg.on);
@@ -892,6 +901,13 @@ function wsOfTab(tabId) {
     if (ws.tabIds.includes(tabId)) return ws;
   }
   return null;
+}
+
+// 找出某个标签页所在工作区的运行时（页面推来事件时要送给"管这一页"的那份工作区）
+function runtimeOfTab(tabId) {
+  const ws = wsOfTab(tabId);
+  if (!ws) return null;
+  return workspaces.get(ws.id)?.rt || null;
 }
 
 function activeRuntime() {
